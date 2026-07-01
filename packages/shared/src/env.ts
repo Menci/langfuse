@@ -255,6 +255,10 @@ const EnvSchema = z.object({
   LANGFUSE_S3_MEDIA_UPLOAD_SSE: z.enum(["AES256", "aws:kms"]).optional(),
   LANGFUSE_S3_MEDIA_UPLOAD_SSE_KMS_KEY_ID: z.string().optional(),
   LANGFUSE_USE_AZURE_BLOB: z.enum(["true", "false"]).default("false"),
+  LANGFUSE_AZURE_BLOB_AUTH_METHOD: z
+    .enum(["shared-key", "managed-identity"])
+    .default("shared-key"),
+  LANGFUSE_AZURE_BLOB_CLIENT_ID: z.string().optional(),
   LANGFUSE_AZURE_SKIP_CONTAINER_CHECK: z
     .enum(["true", "false"])
     .default("true"),
