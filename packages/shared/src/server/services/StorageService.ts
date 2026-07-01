@@ -366,9 +366,12 @@ let azureContainersExists: Record<string, boolean> = {};
 
 // Azure caps the lifetime of a user delegation key at 7 days. Refresh well
 // before that so a rotating pod-level MI token cannot leave callers with an
-// unusable key mid-request.
+// unusable key mid-request. The refresh margin is deliberately larger than any
+// SAS URL TTL we hand out — the URL's signature stops being honored once the
+// signing key hits its own expiry, so keeping >REFRESH_AHEAD hours of headroom
+// keeps signed URLs valid for their whole ttlSeconds.
 const USER_DELEGATION_KEY_LIFETIME_MS = 6 * 24 * 60 * 60 * 1000; // 6 days
-const USER_DELEGATION_KEY_REFRESH_AHEAD_MS = 60 * 60 * 1000; // 1 hour
+const USER_DELEGATION_KEY_REFRESH_AHEAD_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 class AzureBlobStorageService implements StorageService {
   private client: ContainerClient;
@@ -691,7 +694,17 @@ class AzureBlobStorageService implements StorageService {
     const blockBlobClient = this.client.getBlockBlobClient(fileName);
     if (this.useManagedIdentity) {
       const key = await this.getUserDelegationKey();
-      return blockBlobClient.generateUserDelegationSasUrl(sasOptions, key);
+      // Azure rejects a SAS URL past the delegation key's own signedExpiresOn
+      // regardless of the URL's se claim, so clamp expiresOn defensively.
+      // REFRESH_AHEAD_MS keeps this from firing in practice for any Langfuse
+      // caller — the guard is here for robustness against future callers that
+      // might request a longer TTL.
+      const keyExpiresOn = new Date(key.signedExpiresOn);
+      const cappedOptions =
+        sasOptions.expiresOn > keyExpiresOn
+          ? { ...sasOptions, expiresOn: keyExpiresOn }
+          : sasOptions;
+      return blockBlobClient.generateUserDelegationSasUrl(cappedOptions, key);
     }
     return blockBlobClient.generateSasUrl(sasOptions);
   }
