@@ -3,6 +3,13 @@ import type { QueueBaseOptions } from "bullmq";
 import fs from "fs";
 import { env } from "../../env";
 import { logger } from "../logger";
+import {
+  RefreshingTokenManager,
+  createAzureManagedCredentialProvider,
+  type ManagedAccessToken,
+} from "../auth/credentials";
+
+const AZURE_REDIS_SCOPE = "https://redis.azure.com/.default";
 
 const defaultRedisOptions: Partial<RedisOptions> = {
   enableReadyCheck: true,
@@ -200,6 +207,109 @@ const createRedisSentinelInstance = (
   return instance;
 };
 
+// ioredis has no async credential hook. To pipe a rotating AAD token to the
+// live TCP session we (a) start lazyConnect, (b) fetch the initial token when
+// connect() is invoked, (c) subscribe to RefreshingTokenManager and issue AUTH
+// on the open connection whenever a refresh lands. If AUTH fails mid-session
+// we drop the connection so ioredis's retryStrategy reconnects and the wrapper
+// re-fetches a fresh token on the way in.
+const applyAzureManagedIdentityAuth = (
+  instance: Redis,
+  options: RedisOptions,
+  username: string,
+): void => {
+  const provider = createAzureManagedCredentialProvider({
+    name: "redis",
+    scope: AZURE_REDIS_SCOPE,
+    clientId: env.REDIS_AZURE_CLIENT_ID,
+    username,
+  });
+  const manager = new RefreshingTokenManager(provider);
+
+  const applyToken = (token: ManagedAccessToken): void => {
+    options.password = token.token;
+    (instance.options as RedisOptions).password = token.token;
+  };
+
+  const originalConnect = instance.connect.bind(instance);
+  (instance as unknown as { connect: typeof instance.connect }).connect = ((
+    ...args: Parameters<typeof originalConnect>
+  ) =>
+    manager.start().then((token) => {
+      applyToken(token);
+      return originalConnect(...args);
+    })) as typeof instance.connect;
+
+  manager.onRefresh((token) => {
+    applyToken(token);
+    if (instance.status !== "ready") return;
+    // Fire the AUTH command on the live socket. If it fails (network blip,
+    // NOAUTH race), disconnect and let ioredis reconnect with the fresh token
+    // via the wrapped connect() path.
+    instance.call("AUTH", username, token.token).catch((error) => {
+      logger.error(
+        "Failed to send AUTH with refreshed Azure Managed Redis token; forcing reconnect",
+        error,
+      );
+      instance.disconnect(true); // reconnect
+    });
+  });
+
+  instance.on("end", () => {
+    manager.stop();
+  });
+};
+
+const createAzureManagedRedisInstance = (
+  additionalOptions: Partial<RedisOptions>,
+): Redis | null => {
+  if (env.REDIS_CLUSTER_ENABLED === "true") {
+    logger.error(
+      "REDIS_AUTH_METHOD=azure-managed-identity is not supported with REDIS_CLUSTER_ENABLED=true. Strict compliance requires per-connection AUTH rotation, which ioredis Cluster mode does not surface reliably.",
+    );
+    return null;
+  }
+  if (env.REDIS_SENTINEL_ENABLED === "true") {
+    logger.error(
+      "REDIS_AUTH_METHOD=azure-managed-identity is not supported with REDIS_SENTINEL_ENABLED=true. Strict compliance requires per-connection AUTH rotation, which ioredis Sentinel mode does not surface reliably.",
+    );
+    return null;
+  }
+  if (!env.REDIS_USERNAME) {
+    logger.error(
+      "REDIS_USERNAME (the principal name used for AAD AUTH) is required when REDIS_AUTH_METHOD=azure-managed-identity",
+    );
+    return null;
+  }
+  if (!env.REDIS_HOST) {
+    logger.error(
+      "REDIS_HOST is required when REDIS_AUTH_METHOD=azure-managed-identity",
+    );
+    return null;
+  }
+
+  const tlsOptions = buildTlsOptions();
+  const options: RedisOptions = {
+    host: String(env.REDIS_HOST),
+    port: Number(env.REDIS_PORT),
+    username: env.REDIS_USERNAME,
+    // Defer connect so applyAzureManagedIdentityAuth can inject the initial
+    // AAD token before ioredis sends AUTH.
+    lazyConnect: true,
+    ...defaultRedisOptions,
+    ...additionalOptions,
+    ...tlsOptions,
+  };
+  const instance = new Redis(options);
+  applyAzureManagedIdentityAuth(instance, options, env.REDIS_USERNAME);
+
+  instance.on("error", (error) => {
+    logger.error("Redis error", error);
+  });
+
+  return instance;
+};
+
 export const createNewRedisInstance = (
   additionalOptions: Partial<RedisOptions> = {},
 ): Redis | Cluster | null => {
@@ -211,6 +321,10 @@ export const createNewRedisInstance = (
       "Invalid Redis configuration: REDIS_CLUSTER_ENABLED and REDIS_SENTINEL_ENABLED cannot both be true",
     );
     return null;
+  }
+
+  if (env.REDIS_AUTH_METHOD === "azure-managed-identity") {
+    return createAzureManagedRedisInstance(additionalOptions);
   }
 
   if (env.REDIS_CLUSTER_ENABLED === "true") {
