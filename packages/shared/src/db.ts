@@ -28,9 +28,25 @@ export class PrismaClientSingleton {
 // pg calls the password callback once per new pool client (not per query). So a
 // long-lived pool naturally picks up a rotated AAD token whenever a fresh
 // client is established (idle timeout, server-side disconnect, pool grow).
-const createAzureManagedPgPool = (): Pool =>
-  new Pool({
-    connectionString: env.DATABASE_URL,
+//
+// We parse DATABASE_URL manually into explicit fields rather than passing
+// connectionString to Pool: pg-connection-string surfaces a missing password
+// as an empty string, and pg-pool then treats the password field as "defined"
+// and never calls the async callback. Feeding host/port/user/database as
+// separate options keeps the callback authoritative.
+const createAzureManagedPgPool = (): Pool => {
+  if (!env.DATABASE_URL) {
+    throw new Error("DATABASE_URL is required under azure-managed-identity");
+  }
+  const url = new URL(env.DATABASE_URL);
+  const sslmode = url.searchParams.get("sslmode");
+  const sslEnabled = sslmode !== "disable" && sslmode !== undefined;
+  return new Pool({
+    host: url.hostname,
+    port: url.port ? Number(url.port) : 5432,
+    user: decodeURIComponent(url.username),
+    database: url.pathname.replace(/^\//, ""),
+    ssl: sslEnabled ? { rejectUnauthorized: false } : false,
     password: async () => {
       const credential = getAzureCredential(env.DATABASE_AZURE_CLIENT_ID);
       const token = await credential.getToken(AZURE_POSTGRES_SCOPE);
@@ -42,6 +58,7 @@ const createAzureManagedPgPool = (): Pool =>
       return token.token;
     },
   });
+};
 
 const createPrismaInstance = () => {
   const useManagedIdentity =
