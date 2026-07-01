@@ -4,6 +4,22 @@ import { describe, expect, it, vi } from "vitest";
 
 import { StorageServiceFactory } from "./StorageService";
 
+vi.mock("@azure/identity", () => {
+  class DefaultAzureCredential {
+    getToken = vi.fn().mockResolvedValue({
+      token: "aad-token",
+      expiresOnTimestamp: Date.now() + 3600_000,
+    });
+  }
+  class ManagedIdentityCredential {
+    getToken = vi.fn().mockResolvedValue({
+      token: "aad-token",
+      expiresOnTimestamp: Date.now() + 3600_000,
+    });
+  }
+  return { DefaultAzureCredential, ManagedIdentityCredential };
+});
+
 /**
  * Regression tests for the Azure Blob download path.
  *
@@ -229,5 +245,90 @@ describe("GoogleCloudStorageService signed-URL retry", () => {
       "https://signed-read-url",
     );
     expect(getSignedUrl).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("AzureBlobStorageService managed identity", () => {
+  it("constructs without shared-key credentials when useAzureManagedIdentity is set", () => {
+    expect(() =>
+      StorageServiceFactory.getInstance({
+        accessKeyId: undefined,
+        secretAccessKey: undefined,
+        bucketName: "test-container",
+        endpoint: "https://test.blob.core.windows.net",
+        region: undefined,
+        forcePathStyle: false,
+        useAzureBlob: true,
+        useAzureManagedIdentity: true,
+        azureClientId: "test-client-id",
+        awsSse: undefined,
+        awsSseKmsKeyId: undefined,
+      }),
+    ).not.toThrow();
+  });
+
+  it("caches the user delegation key across signed-URL requests and refreshes when the key expires", async () => {
+    const now = 1_700_000_000_000;
+    vi.setSystemTime(now);
+
+    const service = StorageServiceFactory.getInstance({
+      accessKeyId: undefined,
+      secretAccessKey: undefined,
+      bucketName: "test-container",
+      endpoint: "https://test.blob.core.windows.net",
+      region: undefined,
+      forcePathStyle: false,
+      useAzureBlob: true,
+      useAzureManagedIdentity: true,
+      awsSse: undefined,
+      awsSseKmsKeyId: undefined,
+    });
+
+    const internals = service as unknown as {
+      blobServiceClient: {
+        getUserDelegationKey: (start: Date, end: Date) => Promise<unknown>;
+      };
+      client: {
+        url: string;
+        getBlockBlobClient: (name: string) => {
+          generateUserDelegationSasUrl: (
+            options: unknown,
+            key: unknown,
+          ) => Promise<string>;
+        };
+      };
+      createContainerIfNotExists: () => Promise<void>;
+    };
+
+    // Skip the network container check.
+    internals.createContainerIfNotExists = vi.fn().mockResolvedValue(undefined);
+
+    let keyEpoch = 0;
+    const getUserDelegationKey = vi.fn(
+      async (_start: Date, expiresOn: Date) => {
+        keyEpoch += 1;
+        return {
+          signedExpiresOn: expiresOn.toISOString(),
+          value: `delegation-key-${keyEpoch}`,
+        };
+      },
+    );
+    internals.blobServiceClient.getUserDelegationKey = getUserDelegationKey;
+
+    const generateUserDelegationSasUrl = vi.fn(async () => "sas://signed");
+    internals.client.getBlockBlobClient = () => ({
+      generateUserDelegationSasUrl,
+    });
+
+    await service.getSignedUrl("a.txt", 60);
+    await service.getSignedUrl("b.txt", 60);
+    expect(getUserDelegationKey).toHaveBeenCalledTimes(1);
+
+    // Advance past the delegation key lifetime.
+    vi.setSystemTime(now + 7 * 24 * 60 * 60 * 1000);
+    await service.getSignedUrl("c.txt", 60);
+    expect(getUserDelegationKey).toHaveBeenCalledTimes(2);
+
+    vi.useRealTimers();
   });
 });

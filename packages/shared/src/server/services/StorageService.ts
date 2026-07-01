@@ -17,10 +17,13 @@ import {
   StorageSharedKeyCredential,
   newPipeline,
   type RequestPolicyFactory,
+  type UserDelegationKey,
 } from "@azure/storage-blob";
+import type { TokenCredential } from "@azure/identity";
 import { Storage, Bucket, GetSignedUrlConfig } from "@google-cloud/storage";
 import { logger } from "../logger";
 import { env } from "../../env";
+import { getAzureCredential } from "../auth/credentials";
 import { backOff } from "exponential-backoff";
 import { ServiceUnavailableError } from "../../errors";
 import {
@@ -197,10 +200,10 @@ function addS3DiagnosticsMiddleware(
 }
 
 function createAzureBlobPipeline(
-  sharedKeyCredential: StorageSharedKeyCredential,
+  credential: StorageSharedKeyCredential | TokenCredential,
   connectionValidation?: OutboundUrlConnectionValidationOptions,
 ): ReturnType<typeof newPipeline> {
-  const pipeline = newPipeline(sharedKeyCredential);
+  const pipeline = newPipeline(credential);
 
   if (connectionValidation) {
     pipeline.factories.push(
@@ -282,6 +285,13 @@ export class StorageServiceFactory {
    * @param params.region - Region in which the bucket resides
    * @param params.forcePathStyle - Add bucket name into the path instead of the domain name. Mainly used for MinIO.
    * @param params.useAzureBlob - Use Azure Blob Storage instead of S3
+   * @param params.useAzureManagedIdentity - Authenticate to Azure Blob via a
+   *   pod-level managed identity (workload identity on AKS). When true,
+   *   accessKeyId / secretAccessKey are ignored and the token is fetched from
+   *   the platform's IMDS/AAD endpoint. Falls back to LANGFUSE_AZURE_BLOB_AUTH_METHOD.
+   * @param params.azureClientId - Optional user-assigned managed identity
+   *   client id. Omit to use the system-assigned identity or the
+   *   process-default credential chain.
    * @param params.useOCIObjectStorage - Use OCI Object Storage instead of S3
    * @param params.useGoogleCloudStorage - Use Google Cloud Storage instead of S3
    * @param params.googleCloudCredentials - Google Cloud Storage credentials JSON string or path to credentials file
@@ -298,6 +308,8 @@ export class StorageServiceFactory {
     region: string | undefined;
     forcePathStyle: boolean;
     useAzureBlob?: boolean;
+    useAzureManagedIdentity?: boolean;
+    azureClientId?: string;
     useGoogleCloudStorage?: boolean;
     useOCIObjectStorage?: boolean;
     googleCloudCredentials?: string;
@@ -310,7 +322,14 @@ export class StorageServiceFactory {
         ? params.useAzureBlob
         : env.LANGFUSE_USE_AZURE_BLOB === "true"
     ) {
-      return new AzureBlobStorageService(params);
+      return new AzureBlobStorageService({
+        ...params,
+        useManagedIdentity:
+          params.useAzureManagedIdentity ??
+          env.LANGFUSE_AZURE_BLOB_AUTH_METHOD === "managed-identity",
+        azureClientId:
+          params.azureClientId ?? env.LANGFUSE_AZURE_BLOB_CLIENT_ID,
+      });
     }
     if (
       params.useGoogleCloudStorage !== undefined
@@ -344,10 +363,22 @@ export class StorageServiceFactory {
 }
 
 let azureContainersExists: Record<string, boolean> = {};
+
+// Azure caps the lifetime of a user delegation key at 7 days. Refresh well
+// before that so a rotating pod-level MI token cannot leave callers with an
+// unusable key mid-request.
+const USER_DELEGATION_KEY_LIFETIME_MS = 6 * 24 * 60 * 60 * 1000; // 6 days
+const USER_DELEGATION_KEY_REFRESH_AHEAD_MS = 60 * 60 * 1000; // 1 hour
+
 class AzureBlobStorageService implements StorageService {
   private client: ContainerClient;
+  private blobServiceClient: BlobServiceClient;
   private container: string;
   private externalEndpoint: string | undefined;
+  private useManagedIdentity: boolean;
+  private cachedUserDelegationKey: UserDelegationKey | null = null;
+  private cachedUserDelegationKeyPromise: Promise<UserDelegationKey> | null =
+    null;
 
   constructor(params: {
     accessKeyId: string | undefined;
@@ -357,26 +388,45 @@ class AzureBlobStorageService implements StorageService {
     externalEndpoint?: string | undefined;
     region: string | undefined;
     forcePathStyle: boolean;
+    useManagedIdentity?: boolean;
+    azureClientId?: string;
     connectionValidation?: OutboundUrlConnectionValidationOptions;
   }) {
-    const { accessKeyId, secretAccessKey, endpoint, externalEndpoint } = params;
-    if (!accessKeyId || !secretAccessKey || !endpoint) {
-      throw new Error(
-        `Endpoint, account and account key must be configured to use Azure Blob Storage`,
-      );
-    }
-
-    this.externalEndpoint = externalEndpoint;
-    const sharedKeyCredential = new StorageSharedKeyCredential(
+    const {
       accessKeyId,
       secretAccessKey,
-    );
+      endpoint,
+      externalEndpoint,
+      useManagedIdentity = false,
+      azureClientId,
+    } = params;
+
+    if (!endpoint) {
+      throw new Error(`Endpoint must be configured to use Azure Blob Storage`);
+    }
+
+    this.useManagedIdentity = useManagedIdentity;
+    this.externalEndpoint = externalEndpoint;
+
+    let credential: StorageSharedKeyCredential | TokenCredential;
+    if (useManagedIdentity) {
+      credential = getAzureCredential(azureClientId);
+    } else {
+      if (!accessKeyId || !secretAccessKey) {
+        throw new Error(
+          `Account and account key must be configured to use Azure Blob Storage under shared-key auth`,
+        );
+      }
+      credential = new StorageSharedKeyCredential(accessKeyId, secretAccessKey);
+    }
+
     const pipeline = createAzureBlobPipeline(
-      sharedKeyCredential,
+      credential,
       params.connectionValidation,
     );
 
     const blobServiceClient = new BlobServiceClient(endpoint, pipeline);
+    this.blobServiceClient = blobServiceClient;
     this.container = params.bucketName;
     this.client = blobServiceClient.getContainerClient(this.container);
   }
@@ -591,6 +641,61 @@ class AzureBlobStorageService implements StorageService {
     }
   }
 
+  // Under managed identity, generateSasUrl throws because there is no shared
+  // key to sign with. Azure requires a user delegation key (a short-lived key
+  // obtained via the OAuth token) instead. The key is capped at 7 days by the
+  // service; we refresh it well before that so callers never see an expired
+  // signing key.
+  private async getUserDelegationKey(): Promise<UserDelegationKey> {
+    const now = Date.now();
+    if (
+      this.cachedUserDelegationKey &&
+      new Date(this.cachedUserDelegationKey.signedExpiresOn).getTime() - now >
+        USER_DELEGATION_KEY_REFRESH_AHEAD_MS
+    ) {
+      return this.cachedUserDelegationKey;
+    }
+    // Serialize concurrent refreshes so a burst of signed-URL requests does
+    // not fan out to N parallel getUserDelegationKey calls against Azure.
+    if (this.cachedUserDelegationKeyPromise) {
+      return this.cachedUserDelegationKeyPromise;
+    }
+    this.cachedUserDelegationKeyPromise = (async () => {
+      // Skew the start by a minute so a clock drift between the pod and Azure
+      // does not reject the key as not-yet-valid.
+      const startsOn = new Date(now - 60 * 1000);
+      const expiresOn = new Date(now + USER_DELEGATION_KEY_LIFETIME_MS);
+      const key = await this.blobServiceClient.getUserDelegationKey(
+        startsOn,
+        expiresOn,
+      );
+      this.cachedUserDelegationKey = key;
+      return key;
+    })();
+    try {
+      return await this.cachedUserDelegationKeyPromise;
+    } finally {
+      this.cachedUserDelegationKeyPromise = null;
+    }
+  }
+
+  private async signBlobUrl(
+    fileName: string,
+    sasOptions: {
+      permissions: BlobSASPermissions;
+      expiresOn: Date;
+      contentDisposition?: string;
+      contentType?: string;
+    },
+  ): Promise<string> {
+    const blockBlobClient = this.client.getBlockBlobClient(fileName);
+    if (this.useManagedIdentity) {
+      const key = await this.getUserDelegationKey();
+      return blockBlobClient.generateUserDelegationSasUrl(sasOptions, key);
+    }
+    return blockBlobClient.generateSasUrl(sasOptions);
+  }
+
   public async getSignedUrl(
     fileName: string,
     ttlSeconds: number,
@@ -599,8 +704,7 @@ class AzureBlobStorageService implements StorageService {
     try {
       await this.createContainerIfNotExists();
 
-      const blockBlobClient = this.client.getBlockBlobClient(fileName);
-      let url = await blockBlobClient.generateSasUrl({
+      let url = await this.signBlobUrl(fileName, {
         permissions: BlobSASPermissions.parse("r"),
         expiresOn: new Date(Date.now() + ttlSeconds * 1000),
         contentDisposition: asAttachment
@@ -634,8 +738,7 @@ class AzureBlobStorageService implements StorageService {
     try {
       await this.createContainerIfNotExists();
 
-      const blockBlobClient = this.client.getBlockBlobClient(path);
-      let url = await blockBlobClient.generateSasUrl({
+      let url = await this.signBlobUrl(path, {
         permissions: BlobSASPermissions.parse("w"),
         expiresOn: new Date(Date.now() + ttlSeconds * 1000),
         contentType: contentType,
