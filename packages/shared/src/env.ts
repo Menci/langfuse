@@ -43,6 +43,10 @@ const EnvSchema = z.object({
     .enum(["password", "azure-managed-identity"])
     .default("password"),
   REDIS_AZURE_CLIENT_ID: z.string().optional(),
+  DATABASE_AUTH_METHOD: z
+    .enum(["password", "azure-managed-identity"])
+    .default("password"),
+  DATABASE_AZURE_CLIENT_ID: z.string().optional(),
   REDIS_CONNECTION_STRING: z.string().nullish(),
   // Optional prefix for Redis keys. Used by BullMQ queues via their native prefix option
   // and by the singleton cache instance via ioredis keyPrefix. Useful for multi-tenant Redis.
