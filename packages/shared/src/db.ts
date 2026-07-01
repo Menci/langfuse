@@ -1,9 +1,15 @@
 // This file exports the prisma db connection, the Prisma Object, and the Typescript types.
 // This is not imported in the index.ts file of this package, as we must not import this into FE code.
 
+import { PrismaPg } from "@prisma/adapter-pg";
 import { Prisma, PrismaClient } from "@prisma/client";
+import { Pool } from "pg";
 import { env } from "process";
+import { getAzureCredential } from "./server/auth/credentials";
 import { logger } from "./server";
+
+const AZURE_POSTGRES_SCOPE =
+  "https://ossrdbms-aad.database.windows.net/.default";
 
 export class PrismaClientSingleton {
   private static instance: PrismaClient;
@@ -19,17 +25,48 @@ export class PrismaClientSingleton {
   }
 }
 
+// pg calls the password callback once per new pool client (not per query). So a
+// long-lived pool naturally picks up a rotated AAD token whenever a fresh
+// client is established (idle timeout, server-side disconnect, pool grow).
+const createAzureManagedPgPool = (): Pool =>
+  new Pool({
+    connectionString: env.DATABASE_URL,
+    password: async () => {
+      const credential = getAzureCredential(env.DATABASE_AZURE_CLIENT_ID);
+      const token = await credential.getToken(AZURE_POSTGRES_SCOPE);
+      if (!token) {
+        throw new Error(
+          `Azure credential returned no token for scope ${AZURE_POSTGRES_SCOPE}`,
+        );
+      }
+      return token.token;
+    },
+  });
+
 const createPrismaInstance = () => {
-  const client = new PrismaClient<
-    Prisma.PrismaClientOptions,
-    "warn" | "error" | "query"
-  >({
+  const useManagedIdentity =
+    env.DATABASE_AUTH_METHOD === "azure-managed-identity";
+
+  const clientOptions: Prisma.PrismaClientOptions = {
     log: [
       { emit: "event", level: "query" },
       { emit: "event", level: "error" },
       { emit: "event", level: "warn" },
     ],
-  });
+  };
+
+  if (useManagedIdentity) {
+    clientOptions.adapter = new PrismaPg(createAzureManagedPgPool(), {
+      // Let Prisma close the pool on $disconnect so a graceful shutdown
+      // drains sockets rather than leaking them.
+      disposeExternalPool: true,
+    });
+  }
+
+  const client = new PrismaClient<
+    Prisma.PrismaClientOptions,
+    "warn" | "error" | "query"
+  >(clientOptions);
 
   if (env.NODE_ENV === "development") {
     client.$on("query", (event) => {

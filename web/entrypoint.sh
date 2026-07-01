@@ -86,6 +86,19 @@ if [ -z "$DIRECT_URL" ]; then
     export DIRECT_URL="${DATABASE_URL}"
 fi
 
+# Under Azure workload identity, the runtime driver adapter fetches AAD tokens
+# per connection. Prisma's migration binaries read DATABASE_URL/DIRECT_URL
+# directly and cannot go through the adapter, so we fetch a one-shot token here
+# and inject it as the password for the duration of the migration step.
+if [ "$DATABASE_AUTH_METHOD" = "azure-managed-identity" ]; then
+    _mi_url=$(node packages/shared/scripts/build-azure-managed-database-url.mjs) || {
+        echo "Failed to fetch Azure AAD token for Postgres migration bootstrap"
+        exit 1
+    }
+    export DATABASE_URL="$_mi_url"
+    export DIRECT_URL="$_mi_url"
+fi
+
 # Always execute the postgres migration, except when disabled.
 if [ "$LANGFUSE_AUTO_POSTGRES_MIGRATION_DISABLED" != "true" ]; then
     prisma db execute --url "$DIRECT_URL" --file "./packages/shared/scripts/cleanup.sql"
