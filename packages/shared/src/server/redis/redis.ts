@@ -229,6 +229,17 @@ const applyAzureManagedIdentityAuth = (
   const applyToken = (token: ManagedAccessToken): void => {
     options.password = token.token;
     (instance.options as RedisOptions).password = token.token;
+    // ioredis snapshots password into `condition.auth` at construction time
+    // and consults that snapshot for every AUTH — mutating options.password
+    // alone is not enough. Rewrite the snapshot so the next connect (both the
+    // wrapped initial one and any ioredis auto-reconnect) sends the fresh
+    // token.
+    const conditioned = instance as unknown as {
+      condition: { auth: string | [string, string] } | null;
+    };
+    if (conditioned.condition) {
+      conditioned.condition.auth = [username, token.token];
+    }
   };
 
   const originalConnect = instance.connect.bind(instance);
