@@ -44,6 +44,10 @@ kubectl apply -f k8s/08-clickhouse-keeper.yaml  # wait for chk Completed
 kubectl apply -f k8s/10-clickhouse-chi.yaml     # wait for chi Completed
 kubectl apply -f k8s/20-langfuse-web.yaml
 kubectl apply -f k8s/21-langfuse-worker.yaml
+
+# Geneva telemetry (mdsd + fluentd + mdm) — see "Geneva onboarding" below
+kubectl apply -f k8s/29-geneva-rbac.yaml
+kubectl apply -f k8s/30-geneva-services.yaml
 ```
 
 Every step is idempotent; re-apply is safe.
@@ -70,6 +74,30 @@ Every step is idempotent; re-apply is safe.
   2-replica + `clickhouse-backup` sidecar (hourly incremental, daily
   full, 7-day retention, uploaded to `langfuse-clickhouse-backup` via
   workload identity).
+
+## Geneva onboarding
+
+The DaemonSet reuses the existing `SocietasLogNonProd` Geneva account
+(also used by the societas project) — same account owner, same cert,
+same MDM/MDSD auth id (`dev.geneva.keyvault.societas-test.microsoft.com`).
+Our data is namespaced by:
+
+- `MONITORING_TENANT: aks-evaluation-wcus`
+- `MONITORING_ROLE: EvaluationLangfuseNonProd`
+
+Cert distribution:
+
+- `evaluation-langfuse-kv` (Key Vault in the Evaluation RG) holds the
+  Geneva PEM at secret name `geneva-cert`. `langfuse-workload-sa` has
+  `Key Vault Secrets User` on it.
+- `SecretProviderClass geneva-kvcert` (via the AKS
+  `azureKeyvaultSecretsProvider` addon) mounts it at
+  `/geneva/geneva_auth/geneva_cert.pem` inside the mdsd + mdm containers.
+- When societas rotates the cert (cert is bound to
+  `geneva.keyvault.societas-test.microsoft.com`, currently valid to
+  Oct 2026), pull the fresh PEM from a running societas geneva-services
+  pod and re-`az keyvault secret set` it into `evaluation-langfuse-kv`.
+  The CSI driver poll interval propagates the change automatically.
 
 ## Restore procedure (validated 2026-07-02)
 
