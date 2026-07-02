@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: langfuse-env
+  namespace: langfuse
+data:
+  # Postgres via Azure Workload Identity (from our fork's PR #4)
+  DATABASE_URL: "postgresql://evaluation-langfuse-wi@langfuse-pg-wcus.postgres.database.azure.com:5432/langfuse?sslmode=require"
+  DATABASE_AUTH_METHOD: "azure-managed-identity"
+  DATABASE_AZURE_CLIENT_ID: "212f6ee2-d21f-4e9a-87b1-99da9ec13d8b"
+
+  # Redis via Azure Workload Identity (from our fork's PR #3)
+  REDIS_HOST: "langfuse-redis.westcentralus.redis.azure.net"
+  REDIS_PORT: "10000"
+  REDIS_USERNAME: "212f6ee2-d21f-4e9a-87b1-99da9ec13d8b"
+  REDIS_AUTH_METHOD: "azure-managed-identity"
+  REDIS_AZURE_CLIENT_ID: "212f6ee2-d21f-4e9a-87b1-99da9ec13d8b"
+  REDIS_TLS_ENABLED: "true"
+
+  # Azure Blob via Azure Workload Identity (from our fork's PR #2)
+  LANGFUSE_USE_AZURE_BLOB: "true"
+  LANGFUSE_AZURE_BLOB_AUTH_METHOD: "managed-identity"
+  LANGFUSE_AZURE_BLOB_CLIENT_ID: "212f6ee2-d21f-4e9a-87b1-99da9ec13d8b"
+  LANGFUSE_AZURE_SKIP_CONTAINER_CHECK: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "langfuse-events"
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "https://evaluationwcus.blob.core.windows.net"
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: "westcentralus"
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: "langfuse-media"
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: "https://evaluationwcus.blob.core.windows.net"
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: "westcentralus"
+  LANGFUSE_S3_BATCH_EXPORT_ENABLED: "true"
+  LANGFUSE_S3_BATCH_EXPORT_BUCKET: "langfuse-batch-export"
+  LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: "https://evaluationwcus.blob.core.windows.net"
+  LANGFUSE_S3_BATCH_EXPORT_REGION: "westcentralus"
+
+  # Azure OpenAI via Azure Workload Identity (from our fork's PR #5)
+  LANGFUSE_AZURE_OPENAI_AUTH_METHOD: "managed-identity"
+  LANGFUSE_AZURE_OPENAI_CLIENT_ID: "212f6ee2-d21f-4e9a-87b1-99da9ec13d8b"
+
+  # ClickHouse (self-hosted, 2-replica ReplicatedMergeTree on L8s_v4 local NVMe)
+  # The Altinity operator exposes the whole cluster behind
+  # `clickhouse-<chi>.<ns>` (load-balances across replicas) and each replica
+  # individually behind `chi-<chi>-<cluster>-<shard>-<replica>`.
+  CLICKHOUSE_URL: "http://clickhouse-langfuse.langfuse.svc.cluster.local:8123"
+  # Migrations must be pinned to a specific replica: `ON CLUSTER default` DDL
+  # only broadcasts to replicas the initiator sees in its own cluster config
+  # at the moment of DDL submission. If the initiator is picked round-robin
+  # and hits a replica whose config hasn't yet caught up with a freshly
+  # scheduled peer, that peer permanently sees the DDL as "not for me"
+  # (`no local address in host list`) and never converges. Pin to 0-0.
+  CLICKHOUSE_MIGRATION_URL: "clickhouse://chi-langfuse-default-0-0.langfuse.svc.cluster.local:9000"
+  CLICKHOUSE_USER: "default"
+  CLICKHOUSE_DB: "default"
+  CLICKHOUSE_CLUSTER_ENABLED: "true"
+
+  # App misc
+  TELEMETRY_ENABLED: "false"
+  LANGFUSE_LOG_LEVEL: "info"
+  NEXT_PUBLIC_LANGFUSE_RUN_NEXT_INIT: "true"

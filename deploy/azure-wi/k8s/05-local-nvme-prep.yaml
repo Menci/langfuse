@@ -1,0 +1,173 @@
+# Reserves /mnt/disks/nvme0 on every L-series node for local-static-provisioner.
+#
+# AKS provisions L8s_v4 with `diffDiskSettings.placement: NvmeDisk`, i.e. the
+# ephemeral OS disk consumes the entire 1.79 TB local NVMe (all 4 physical
+# NVMe stitched together, no separate data device exposed). That leaves the
+# whole local NVMe as the root filesystem, so we don't need mdadm / mkfs.xfs
+# / mount here — a directory on the root FS already IS backed by local NVMe
+# and inherits its 550k read / 220k write IOPS budget.
+#
+# The DaemonSet just creates the directory once and stays running so k8s
+# doesn't reschedule it in a loop.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvme-raid-prep
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels: {app: nvme-raid-prep}
+  template:
+    metadata:
+      labels: {app: nvme-raid-prep}
+    spec:
+      nodeSelector:
+        workload: clickhouse
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: clickhouse
+          effect: NoSchedule
+      containers:
+        - name: prep
+          image: alpine:3.20
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: disks
+              mountPath: /mnt/disks
+              mountPropagation: Bidirectional
+          command:
+            - sh
+            - -euc
+            - |
+              mkdir -p /mnt/disks/nvme0
+              chmod 0777 /mnt/disks/nvme0
+              # local-static-provisioner refuses to publish a discovered
+              # path as a PV unless it's a distinct mount point. Bind-mount
+              # the directory onto itself so /proc/mounts sees an entry
+              # without changing the underlying filesystem.
+              if ! mountpoint -q /mnt/disks/nvme0; then
+                mount --bind /mnt/disks/nvme0 /mnt/disks/nvme0
+              fi
+              exec sleep infinity
+      volumes:
+        - name: disks
+          hostPath: {path: /mnt/disks, type: DirectoryOrCreate}
+---
+# sig-storage-local-static-provisioner discovers directories under
+# /mnt/disks and exposes each subdirectory as a local PV. We provision one
+# 1.7Ti PV per node from the /mnt/disks/nvme0 mount.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-nvme
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-provisioner-config
+  namespace: kube-system
+data:
+  storageClassMap: |
+    local-nvme:
+      hostDir: /mnt/disks
+      mountDir: /mnt/disks
+      blockCleanerCommand:
+        - "/scripts/quick_reset.sh"
+      volumeMode: Filesystem
+      fsType: xfs
+      namePattern: "*"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: local-storage-admin
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: local-storage-provisioner-pv-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:persistent-volume-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: local-storage-admin
+    namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: local-storage-provisioner-node-clusterrole
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: local-storage-provisioner-node-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: local-storage-provisioner-node-clusterrole
+subjects:
+  - kind: ServiceAccount
+    name: local-storage-admin
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: local-volume-provisioner
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels: {app: local-volume-provisioner}
+  template:
+    metadata:
+      labels: {app: local-volume-provisioner}
+    spec:
+      serviceAccountName: local-storage-admin
+      nodeSelector:
+        workload: clickhouse
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: clickhouse
+          effect: NoSchedule
+      containers:
+        - name: provisioner
+          image: registry.k8s.io/sig-storage/local-volume-provisioner:v2.7.0
+          securityContext:
+            privileged: true
+          env:
+            - name: MY_NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: MY_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: JOB_CONTAINER_IMAGE
+              value: registry.k8s.io/sig-storage/local-volume-provisioner:v2.7.0
+          volumeMounts:
+            - name: provisioner-config
+              mountPath: /etc/provisioner/config
+              readOnly: true
+            - name: provisioner-dev
+              mountPath: /dev
+            - name: disks
+              mountPath: /mnt/disks
+              mountPropagation: HostToContainer
+      volumes:
+        - name: provisioner-config
+          configMap: {name: local-provisioner-config}
+        - name: provisioner-dev
+          hostPath: {path: /dev}
+        - name: disks
+          hostPath: {path: /mnt/disks}

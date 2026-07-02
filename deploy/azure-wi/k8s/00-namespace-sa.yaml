@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: langfuse
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: langfuse-workload-sa
+  namespace: langfuse
+  annotations:
+    azure.workload.identity/client-id: "212f6ee2-d21f-4e9a-87b1-99da9ec13d8b"
+    azure.workload.identity/tenant-id: "72f988bf-86f1-41af-91ab-2d7cd011db47"
+  labels:
+    azure.workload.identity/use: "true"
