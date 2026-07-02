@@ -294,6 +294,25 @@ const applyAzureManagedIdentityAuth = (
   instance.on("end", () => {
     manager.stop();
   });
+
+  // BullMQ's Worker constructor duplicates the passed connection to get a
+  // separate blocking-command channel (redis.duplicate()). Duplicated ioredis
+  // instances inherit `options` by structural clone but NOT the connect
+  // wrapper we installed, so they'd send AUTH with whatever `options.password`
+  // happened to be at duplication time — undefined at cold start, then a
+  // fixed token that never rotates. Rewrap duplicates the same way so every
+  // downstream instance has its own token manager.
+  const originalDuplicate = instance.duplicate.bind(instance);
+  (instance as unknown as { duplicate: typeof instance.duplicate }).duplicate =
+    ((...args: Parameters<typeof originalDuplicate>) => {
+      const duplicated = originalDuplicate(...args);
+      applyAzureManagedIdentityAuth(
+        duplicated,
+        duplicated.options as RedisOptions,
+        username,
+      );
+      return duplicated;
+    }) as typeof instance.duplicate;
 };
 
 const createAzureManagedRedisInstance = (
