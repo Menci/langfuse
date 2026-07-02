@@ -82,7 +82,7 @@ spec:
             - name: TENANT
               value: aks-evaluation-wcus
             - name: ROLE
-              value: EvaluationLangfuseNonProd
+              value: SocietasLogNonProd
             - name: ROLEINSTANCE
               valueFrom:
                 fieldRef:
@@ -90,7 +90,7 @@ spec:
             - name: MONITORING_TENANT
               value: aks-evaluation-wcus
             - name: MONITORING_ROLE
-              value: EvaluationLangfuseNonProd
+              value: SocietasLogNonProd
             - name: MONITORING_ROLE_INSTANCE
               valueFrom:
                 fieldRef:

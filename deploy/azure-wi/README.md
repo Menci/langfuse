@@ -78,26 +78,46 @@ Every step is idempotent; re-apply is safe.
 ## Geneva onboarding
 
 The DaemonSet reuses the existing `SocietasLogNonProd` Geneva account
-(also used by the societas project) — same account owner, same cert,
-same MDM/MDSD auth id (`dev.geneva.keyvault.societas-test.microsoft.com`).
-Our data is namespaced by:
-
-- `MONITORING_TENANT: aks-evaluation-wcus`
-- `MONITORING_ROLE: EvaluationLangfuseNonProd`
+(also used by the societas project) — same account owner, same cert
+identity, same MDM/MDSD auth id
+(`dev.geneva.keyvault.societas-test.microsoft.com`).
+`MONITORING_ROLE` is set to `SocietasLogNonProd` (same string societas
+uses; ROLE is the Geneva account name, not a per-workload identifier).
+Our data is namespaced by `MONITORING_TENANT: aks-evaluation-wcus`.
 
 Cert distribution:
 
-- `evaluation-langfuse-kv` (Key Vault in the Evaluation RG) holds the
-  Geneva PEM at secret name `geneva-cert`. `langfuse-workload-sa` has
-  `Key Vault Secrets User` on it.
+- `evaluation-langfuse-kv` (Key Vault in the Evaluation RG) holds a
+  KV-managed certificate `geneva-cert`. The issuer `PrivateCA` is a
+  named alias for provider `OneCertV2-PrivateCA` (Microsoft internal
+  PKI, same setup as societasKeyVault).
+- The cert policy mirrors societas' exactly: RSA 2048, EKU
+  serverAuth+clientAuth, keyUsage digitalSignature+keyEncipherment,
+  subject `CN=geneva.keyvault.societas-test.microsoft.com`, five SANs
+  spanning `{dev,test,dogfood,stress,staging}.geneva.keyvault.societas-test.microsoft.com`,
+  6-month validity, AutoRenew at 50% lifetime.
+- Because the cert is KV-managed (not imported), OneCert re-issues it
+  automatically at 50% of its lifetime; no manual sync from societas is
+  required for rotation.
 - `SecretProviderClass geneva-kvcert` (via the AKS
   `azureKeyvaultSecretsProvider` addon) mounts it at
-  `/geneva/geneva_auth/geneva_cert.pem` inside the mdsd + mdm containers.
-- When societas rotates the cert (cert is bound to
-  `geneva.keyvault.societas-test.microsoft.com`, currently valid to
-  Oct 2026), pull the fresh PEM from a running societas geneva-services
-  pod and re-`az keyvault secret set` it into `evaluation-langfuse-kv`.
-  The CSI driver poll interval propagates the change automatically.
+  `/geneva/geneva_auth/geneva_cert.pem` inside the mdsd + mdm
+  containers, using `langfuse-workload-sa`'s Key Vault Secrets User
+  binding.
+
+To re-provision the issuer and cert from scratch on a fresh KV:
+
+```
+az keyvault certificate issuer create \
+  --vault-name evaluation-langfuse-kv \
+  --issuer-name PrivateCA \
+  --provider OneCertV2-PrivateCA
+
+az keyvault certificate create \
+  --vault-name evaluation-langfuse-kv \
+  --name geneva-cert \
+  --policy '{...policy JSON mirroring societaskeyvault/certificates/geneva-cert/policy...}'
+```
 
 ## Restore procedure (validated 2026-07-02)
 
