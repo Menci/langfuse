@@ -1,0 +1,81 @@
+# Grants user.admin=true to any invited colleague who has signed in via
+# AAD OAuth in the last 10 minutes but is still admin=false. Runs
+# in-cluster so nothing external needs to be alive to make it work; the
+# entire "wait for teammate, then elevate" loop survives independent of
+# any local session.
+#
+# Reuses langfuse-web's image (has node + prisma + adapter-pg +
+# @azure/identity) and the workload-identity ServiceAccount that already
+# holds AAD admin on the Postgres server. Idempotent: repeated runs on
+# an already-admin user updateMany a zero-row set.
+#
+# When all 5 invitees are admin, the job is a no-op — safe to leave
+# scheduled indefinitely.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: invitee-admin-grant
+  namespace: langfuse
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            azure.workload.identity/use: "true"
+        spec:
+          restartPolicy: Never
+          serviceAccountName: langfuse-workload-sa
+          containers:
+            - name: grant
+              image: societasdev.azurecr.io/langfuse/web:a80eed37e
+              imagePullPolicy: IfNotPresent
+              envFrom:
+                - configMapRef:
+                    name: langfuse-env
+                - secretRef:
+                    name: langfuse-app-secrets
+              command: ["node", "-e"]
+              args:
+                - |
+                  const { PrismaClient } = require("/app/node_modules/.pnpm/@prisma+client@6.19.3_prisma@6.19.3_magicast@0.5.2_typescript@5.9.2__typescript@5.9.2/node_modules/@prisma/client");
+                  const { PrismaPg } = require("/app/node_modules/.pnpm/@prisma+adapter-pg@6.19.3/node_modules/@prisma/adapter-pg");
+                  const { Pool } = require("/app/node_modules/.pnpm/pg@8.13.0/node_modules/pg");
+                  const az = require("/app/node_modules/.pnpm/@azure+identity@4.13.1/node_modules/@azure/identity");
+                  const INVITEES = [
+                    "jianjunchen@microsoft.com",
+                    "yueyingchen@microsoft.com",
+                    "zhouweiwei@microsoft.com",
+                    "xanzh@microsoft.com",
+                    "wuyin@microsoft.com",
+                  ];
+                  const cred = new az.ManagedIdentityCredential({ clientId: process.env.DATABASE_AZURE_CLIENT_ID });
+                  const url = new URL(process.env.DATABASE_URL);
+                  const pool = new Pool({
+                    host: url.hostname, port: 5432,
+                    user: decodeURIComponent(url.username),
+                    database: url.pathname.replace(/^\//, ""),
+                    ssl: { rejectUnauthorized: false },
+                    password: async () => (await cred.getToken("https://ossrdbms-aad.database.windows.net/.default")).token,
+                  });
+                  const p = new PrismaClient({ adapter: new PrismaPg(pool, { disposeExternalPool: true }) });
+                  (async () => {
+                    const pending = await p.user.findMany({ where: { email: { in: INVITEES }, admin: false }, select: { email: true } });
+                    if (pending.length === 0) {
+                      console.log("no invitees pending admin elevation");
+                    } else {
+                      const emails = pending.map(u => u.email);
+                      const r = await p.user.updateMany({ where: { email: { in: emails } }, data: { admin: true } });
+                      console.log(JSON.stringify({ elevated: emails, count: r.count }));
+                    }
+                    await p.$disconnect();
+                  })().catch(e => { console.error("ERR", e.message); process.exit(1); });
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits:   { memory: 512Mi }
