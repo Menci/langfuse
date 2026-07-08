@@ -1,0 +1,40 @@
+# Phase 1 step 1 — one-shot: import the SpreadsheetBench Verified-400
+# task list into a Langfuse Dataset.
+#
+# Wrapper scripts are mounted from a ConfigMap (not baked into the image)
+# so we can iterate on them without a rebuild. The vendored evaluator
+# code stays in the image; only the Langfuse-integration layer is hot.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spreadsheet-bench-import
+  namespace: langfuse
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: import
+          image: societasdev.azurecr.io/langfuse-eval/spreadsheet-bench:latest
+          imagePullPolicy: Always
+          command: [python, /wrapper/import_dataset_spreadsheet_bench.py]
+          envFrom:
+            - secretRef:
+                name: spreadsheet-bench-langfuse-creds
+          volumeMounts:
+            - name: data
+              mountPath: /app/spreadsheet-bench/data
+            - name: wrapper
+              mountPath: /wrapper
+          resources:
+            requests: {cpu: "500m", memory: 1Gi}
+            limits: {memory: 2Gi}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: spreadsheet-bench-data
+        - name: wrapper
+          configMap:
+            name: spreadsheet-bench-wrapper

@@ -1,0 +1,50 @@
+# Phase 1 step 2 — evaluate baseline: score the "no-op skill" outputs.
+#
+# The `init` xlsx that ships with every Verified-400 task is the input a
+# skill would receive; treating it as the *predicted* answer gives the
+# floor pass rate — the fraction of tasks where the golden happens to
+# equal the input untouched. Any real skill run should beat this.
+#
+# Wrapper script is mounted from the ConfigMap so this manifest doesn't
+# need a rebuild when the eval logic evolves.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spreadsheet-bench-eval-init
+  namespace: langfuse
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: evaluate
+          image: societasdev.azurecr.io/langfuse-eval/spreadsheet-bench:latest
+          imagePullPolicy: Always
+          command: [python, /wrapper/evaluate_spreadsheet_bench.py]
+          args:
+            - "--dataset=spreadsheet-bench-v400"
+            - "--run-name=init-baseline"
+            - "--description=Baseline: predicted = the untouched init xlsx (no-op skill floor)"
+            - "--predicted-dir=/app/spreadsheet-bench/data/verified-400/spreadsheet"
+            - "--predicted-template={task_id}/1_{task_id}_init.xlsx"
+            - "--max-concurrency=8"
+          envFrom:
+            - secretRef:
+                name: spreadsheet-bench-langfuse-creds
+          volumeMounts:
+            - name: data
+              mountPath: /app/spreadsheet-bench/data
+            - name: wrapper
+              mountPath: /wrapper
+          resources:
+            requests: {cpu: "2", memory: 2Gi}
+            limits: {memory: 4Gi}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: spreadsheet-bench-data
+        - name: wrapper
+          configMap:
+            name: spreadsheet-bench-wrapper

@@ -134,3 +134,68 @@ kubectl -n langfuse exec chi-langfuse-default-0-0-0 -c clickhouse-backup -- \
 `clickhouse-backup list remote` prints the available backup names (format
 `shard0-full-YYYYMMDDHHMMSS` / `shard0-increment-…`) plus stored size and
 whether the backup is full or delta-linked to a parent.
+
+## SpreadsheetBench evaluation gate
+
+First business workload on this Langfuse deployment: the objective
+(golden-answer) evaluator from
+[SpreadsheetBench](https://github.com/RUCKBReasoning/SpreadsheetBench)
+Verified-400, wrapped as reusable Kubernetes Jobs.
+
+Layered on top of Langfuse SDK v4 `DatasetClient.run_experiment()`, so
+the SDK owns per-item Trace + DatasetRunItem + Score wiring. Wrapper
+scripts under `eval/wrapper/` are mounted through the
+`spreadsheet-bench-wrapper` ConfigMap (not baked into the image), so
+iteration on the Langfuse-integration layer is a `kubectl apply` on the
+ConfigMap and does not require rebuilding
+`societasdev.azurecr.io/langfuse-eval/spreadsheet-bench`.
+
+Vendored spreadsheet-bench code + the Verified-400 dataset are CC BY-SA
+4.0; see `eval/spreadsheet-bench/{NOTICE,LICENSE}.md`.
+
+### Apply order
+
+```
+# One-time image build (Kaniko job on kaniko-build ns, git-context
+# from this branch, Dockerfile at deploy/azure-wi/eval/Dockerfile)
+kubectl apply -f k8s/49-spreadsheet-bench-wrapper-cm.yaml
+kubectl apply -f k8s/50-spreadsheet-bench-selftest.yaml    # Phase 0: PVC + selftest
+kubectl apply -f k8s/51-spreadsheet-bench-import.yaml      # one-shot: 400 items → dataset
+kubectl apply -f k8s/52-spreadsheet-bench-eval-init.yaml   # baseline: init xlsx as predicted
+```
+
+The selftest job also downloads the ~15 MB Verified-400 tarball into the
+`spreadsheet-bench-data` PVC; subsequent import + eval jobs reuse it
+without redownload.
+
+### Running a real skill's outputs
+
+The eval job scores whatever xlsx directory it's pointed at. To score a
+skill run, produce `/predicted/<task_id>.xlsx` files somewhere (either
+inside the cluster on a new PVC, or on the existing PVC under a
+subdirectory) and copy `k8s/52-spreadsheet-bench-eval-init.yaml` into a
+new job spec that changes:
+
+- `--run-name=<label>`  identifies the run in the Langfuse UI compare
+- `--predicted-dir=<path>` where predicted xlsx sit
+- `--predicted-template={task_id}.xlsx` the default flat layout; use a
+  template with slashes only for baseline reuses of the dataset tree
+
+Pass rate + per-task diff detail land on the Langfuse dataset. Compare
+UI at `Datasets → spreadsheet-bench-v400 → Runs` cross-tabulates runs.
+
+### Cross-run baseline
+
+`init-baseline` (no-op skill = identity xlsx) is the floor. Verified
+2026-07-08: 1/400 pass (0.25%) — one task's golden happens to equal its
+init. Any real skill run should beat this.
+
+### Auth surface
+
+- `spreadsheet-bench-langfuse-creds` Secret holds project-scoped
+  pk/sk for the `excel-skill-eval` project inside the `Evaluation`
+  organization. Bootstrap via a Prisma `apiKey.create` call (see git
+  log for the ad-hoc snippet).
+- Everything else (Postgres for dataset writes, ClickHouse for trace /
+  score writes) is reached in-cluster and reuses the
+  `langfuse-workload-sa` chain already set up for web / worker.

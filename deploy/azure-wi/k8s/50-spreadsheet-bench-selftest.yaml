@@ -1,0 +1,59 @@
+# SpreadsheetBench evaluation gate — data volume + Phase 0 self-test.
+#
+# The Verified-400 dataset (15 MB tarball + ~1200 xlsx files after
+# extraction) is downloaded once and cached on a Premium SSD PVC so
+# subsequent jobs (import_dataset, evaluate) reuse it without redownload.
+# The PVC is deliberately mounted at the exact path
+# `data/verified-400/` lives at inside the vendored code
+# (`Path(__file__).parent / "data" / "verified-400"`), so the upstream
+# download_data.py needs no argument or code changes.
+#
+# Phase 0 goal: prove the built image + LibreOffice + PVC + network can
+# download and self-test the dataset. Langfuse SDK is NOT touched here;
+# that lives in Phase 1 (evaluate job).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: spreadsheet-bench-data
+  namespace: langfuse
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: managed-csi-premium
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spreadsheet-bench-selftest
+  namespace: langfuse
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: selftest
+          image: societasdev.azurecr.io/langfuse-eval/spreadsheet-bench:latest
+          imagePullPolicy: Always
+          command: [bash, -euxc]
+          args:
+            - |
+              if [ ! -f /app/spreadsheet-bench/data/verified-400/dataset.json ]; then
+                python /app/spreadsheet-bench/download_data.py
+              else
+                echo "dataset already present on PVC, skipping download"
+              fi
+              python /app/spreadsheet-bench/selftest.py --sample 40
+          volumeMounts:
+            - name: data
+              mountPath: /app/spreadsheet-bench/data
+          resources:
+            requests: {cpu: "1", memory: 2Gi}
+            limits: {memory: 4Gi}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: spreadsheet-bench-data
