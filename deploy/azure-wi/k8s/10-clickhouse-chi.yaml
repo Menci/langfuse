@@ -125,11 +125,17 @@ spec:
                   value: "1"
                 - name: BACKUPS_TO_KEEP_REMOTE
                   value: "168"
-              command: ["clickhouse-backup"]
+              # Keep the sidecar alive before the first Langfuse migration.
+              # A bare `watch` exits after repeated "no tables" errors, which
+              # makes the whole Pod NotReady and suppresses the headless
+              # ClickHouse DNS record that migrations need.
+              command: ["/bin/sh", "-ec"]
               args:
-                - watch
-                - --watch-interval=1h
-                - --full-interval=24h
+                - |
+                  until clickhouse-backup tables 2>/dev/null | grep -q .; do
+                    sleep 30
+                  done
+                  exec clickhouse-backup watch --watch-interval=1h --full-interval=24h
               volumeMounts:
                 - name: local-nvme
                   mountPath: /var/lib/clickhouse
