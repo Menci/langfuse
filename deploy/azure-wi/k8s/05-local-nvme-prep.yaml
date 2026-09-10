@@ -30,7 +30,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: prep
-          image: alpine:3.20
+          image: societasdev.azurecr.io/evaluation/third-party/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
           securityContext:
             privileged: true
           volumeMounts:
@@ -145,7 +145,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: provisioner
-          image: registry.k8s.io/sig-storage/local-volume-provisioner:v2.7.0
+          image: societasdev.azurecr.io/evaluation/third-party/sig-storage/local-volume-provisioner:v2.7.0@sha256:bf8427d8ce78fb6c41043f1fa75fbb1cd3e5bd1d336a6fbc3b13ff5574a30ede
           securityContext:
             privileged: true
           env:
@@ -154,7 +154,7 @@ spec:
             - name: MY_NAMESPACE
               valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
             - name: JOB_CONTAINER_IMAGE
-              value: registry.k8s.io/sig-storage/local-volume-provisioner:v2.7.0
+              value: societasdev.azurecr.io/evaluation/third-party/sig-storage/local-volume-provisioner:v2.7.0@sha256:bf8427d8ce78fb6c41043f1fa75fbb1cd3e5bd1d336a6fbc3b13ff5574a30ede
           volumeMounts:
             - name: provisioner-config
               mountPath: /etc/provisioner/config

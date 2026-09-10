@@ -40,7 +40,7 @@ spec:
                   topologyKey: kubernetes.io/hostname
           containers:
             - name: clickhouse-keeper
-              image: clickhouse/clickhouse-keeper:24.12
+              image: societasdev.azurecr.io/evaluation/third-party/clickhouse/clickhouse-keeper:24.12@sha256:6330e7f43f55c81f227f3a8d54843ab4aaa3078407928c64ad3833a108df7e68
               resources:
                 requests: {cpu: 100m, memory: 256Mi}
                 limits:   {memory: 1Gi}

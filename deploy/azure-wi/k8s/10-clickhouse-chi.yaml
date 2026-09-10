@@ -75,7 +75,7 @@ spec:
                   topologyKey: kubernetes.io/hostname
           containers:
             - name: clickhouse
-              image: clickhouse/clickhouse-server:24.12
+              image: societasdev.azurecr.io/evaluation/third-party/clickhouse/clickhouse-server:24.12@sha256:a65ca89ddbe8e04a05036dd7d7110a203256293b407b9359130ed5e4333f45ff
               volumeMounts:
                 - name: local-nvme
                   mountPath: /var/lib/clickhouse
@@ -83,7 +83,7 @@ spec:
                 requests: {cpu: "4", memory: 32Gi}
                 limits:   {memory: 56Gi}
             - name: clickhouse-backup
-              image: altinity/clickhouse-backup:2.6.20
+              image: societasdev.azurecr.io/evaluation/third-party/altinity/clickhouse-backup:2.6.20@sha256:bd642ce6238f8aa5aa5f01d166767a02edb0b52c51c9bf317ce13f66029620e5
               imagePullPolicy: IfNotPresent
               env:
                 - name: LOG_LEVEL

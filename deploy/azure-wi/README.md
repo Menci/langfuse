@@ -61,6 +61,30 @@ This order bootstraps an environment. For an existing deployment, compare
 the live configuration and update only the intended resources; do not
 replay storage bootstrap or one-shot evaluation Jobs as an upgrade.
 
+## Supported image references
+
+Evaluation-owned third-party images use digest-pinned mirrors under
+`societasdev.azurecr.io/evaluation/third-party/`. Registry migration keeps
+the original content and component versions; it is not a vulnerability
+patch or permission to remove cached images, volumes or backup data.
+The static provisioner's `JOB_CONTAINER_IMAGE` must use the same mirror
+as its running container.
+
+The existing Operator is Helm release `clickhouse-operator` in
+`clickhouse-system`, chart `altinity-clickhouse-operator` version `0.27.1`.
+For an image-only change, retain that chart version and apply
+`operator/sfi-values.yaml` with `--reuse-values --skip-crds --no-hooks`.
+This avoids running unrelated CRD hooks during a registry-reference change.
+The overlay records the effective cluster-wide watch in
+`configs.files.config.yaml`; the historical `operator.watch` value alone
+does not configure it.
+
+Compare rendered resources with the current release and live watch
+configuration before upgrading. Preserve runtime credentials and all
+non-image settings. Rollback must also preserve the effective watch:
+restore the previous image references with the watch overlay rather than
+blindly reverting to an older Helm revision that recorded an empty watch.
+
 ## Runtime-tuned bits pinned in the manifests
 
 - `CLICKHOUSE_MIGRATION_URL` pins to `chi-langfuse-default-0-0` (not the
