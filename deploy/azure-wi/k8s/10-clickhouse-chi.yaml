@@ -1,14 +1,14 @@
 # 2-replica ReplicatedReplacingMergeTree cluster on L8s_v4 local NVMe.
 # Both replicas pinned to the lpool nodepool via nodeSelector + toleration.
-# podAntiAffinity forces them onto different nodes so AKS node reimage /
-# auto-upgrade only ever takes one down at a time.
+# podAntiAffinity places replicas on different nodes. It does not make
+# ephemeral OS storage durable or wait for schema/data recovery.
 #
 # Sidecar `clickhouse-backup` in each replica runs its own watch loop,
 # hard-linking freshly-frozen CH parts and uploading them to
 # `evaluationwcus/langfuse-clickhouse-backup` via workload-identity
 # (langfuse-workload-sa is already annotated with the AAD client id and
 # has Storage Blob Data Owner on the account). Full snapshot daily,
-# incremental every hour, retained 7 days.
+# incremental every hour, with count-based remote retention of 168 backups.
 #
 # Both replicas back up independently under distinct prefixes so a single
 # replica loss can be restored from the other; the daily storage overhead
@@ -120,7 +120,7 @@ spec:
                     secretKeyRef:
                       name: langfuse-app-secrets
                       key: CLICKHOUSE_PASSWORD
-                # 7-day retention, incremental every hour, full every 24h.
+                # Count-based retention, incremental hourly and full daily.
                 - name: BACKUPS_TO_KEEP_LOCAL
                   value: "1"
                 - name: BACKUPS_TO_KEEP_REMOTE
@@ -136,6 +136,31 @@ spec:
                     sleep 30
                   done
                   exec clickhouse-backup watch --watch-interval=1h --full-interval=24h
+              # Keep a newly started replica out of Ready until its schema
+              # and replication queue recover. No recent writes are required.
+              startupProbe:
+                exec:
+                  command:
+                    - /bin/sh
+                    - -ec
+                    - |
+                      auth=$(printf '%s:%s' "$CLICKHOUSE_USERNAME" "$CLICKHOUSE_PASSWORD" | base64 | tr -d '\n')
+                      query="SELECT if(
+                        (SELECT count() FROM system.tables WHERE database = 'default' AND name IN
+                          ('blob_storage_file_log','dataset_run_items','dataset_run_items_rmt','event_log',
+                           'observations','project_environments','schema_migrations','scores','traces')) = 9
+                        AND (SELECT count() FROM system.replicas WHERE database = 'default') >= 7
+                        AND (SELECT countIf(is_readonly OR is_session_expired OR queue_size > 0 OR future_parts > 0)
+                             FROM system.replicas WHERE database = 'default') = 0,
+                        1, 0) FORMAT TabSeparatedRaw"
+                      ready=$(printf 'header = "Authorization: Basic %s"\n' "$auth" |
+                        curl --config - --silent --show-error --fail --max-time 4 \
+                          --url http://127.0.0.1:8123/ --data-binary "$query")
+                      [ "$ready" = "1" ]
+                periodSeconds: 10
+                timeoutSeconds: 5
+                failureThreshold: 180
+                successThreshold: 1
               volumeMounts:
                 - name: local-nvme
                   mountPath: /var/lib/clickhouse
@@ -150,6 +175,7 @@ spec:
           resources:
             requests:
               storage: 1500Gi
-# The Altinity operator auto-creates a PodDisruptionBudget matching the
-# cluster's pods with maxUnavailable=1, so AKS auto-upgrade can only cordon
-# one replica at a time. No hand-authored PDB needed.
+# The operator creates a PodDisruptionBudget with maxUnavailable=1.
+# PDBs constrain voluntary eviction based on Ready, not disk durability.
+# The startup gate prevents an empty replacement from counting as recovered;
+# never force-drain another replica to bypass a failed recovery gate.

@@ -72,10 +72,11 @@ replay storage bootstrap or one-shot evaluation Jobs as an upgrade.
   `connectionString` to pg-pool would surface a missing password as an
   empty string and skip the async token callback entirely.
 - CH data lives on ephemeral local NVMe (`Standard_L8s_v4`, ~1.79 TB per
-  node, 550k read / 220k write IOPS). Durability is `ReplicatedMergeTree`
-  2-replica + `clickhouse-backup` sidecar (hourly incremental, daily
-  full, 7-day retention, uploaded to `langfuse-clickhouse-backup` via
-  workload identity).
+  node, 550k read / 220k write IOPS). Recovery relies on two
+  `ReplicatedMergeTree` replicas and the `clickhouse-backup` sidecars
+  (hourly incremental, daily full, 168-backup remote retention, uploaded
+  to `langfuse-clickhouse-backup` via workload identity). Count-based
+  retention is not a guaranteed seven-day recovery window.
 
 ## Geneva onboarding
 
@@ -144,6 +145,47 @@ kubectl -n langfuse exec chi-langfuse-default-0-0-0 -c clickhouse-backup -- \
 `clickhouse-backup list remote` prints the available backup names (format
 `shard0-full-YYYYMMDDHHMMSS` / `shard0-increment-…`) plus stored size and
 whether the backup is full or delta-linked to a parent.
+
+## Local-volume recovery and node maintenance
+
+The `local-nvme` PV is a directory on the node's ephemeral OS filesystem,
+not a durable managed disk. A Pod restart reuses that directory, but a
+node reimage can replace it. Anti-affinity separates the replicas and
+the PDB limits voluntary eviction; neither proves that a replacement
+replica has recovered its schema and parts.
+
+The backup sidecar has a startup-only gate for the deployed schema and
+local replica catch-up. This keeps an empty replacement Pod out of Ready
+and prevents the PDB from treating it as a recovered replica. An
+initialized cluster with no new events passes the gate. The gate is not
+a recurring traffic-freshness check and does not require both peers to
+remain available during later maintenance. Keep its expected table set
+aligned with the deployed Langfuse migrations.
+
+Per-host ClickHouse Services must publish addresses before Pod readiness
+so migrations and replica recovery can reach a starting host. Confirm
+`publishNotReadyAddresses: true` on those Services; do not force-drain the
+remaining replica to bypass a failed startup gate.
+
+If the catalog disappears, first compare authenticated catalog metadata,
+replica state, volume identity and retained backup metadata. No new
+inserts alone does not remove existing tables. Recover from a healthy
+replica or an approved backup when business parts must be preserved;
+the single-table procedure above is not a whole-cluster recovery proof.
+
+When both catalogs are confirmed empty and the retained snapshot has no
+business parts, initialize the schema using the **deployed Web image's**
+`packages/shared/clickhouse/scripts/up.sh`, targeting the configured
+replica 0. Do not run PostgreSQL cleanup, migration `force`, or a newer
+checkout's migrations as a substitute. After both hosts have their
+expected schema and healthy local replica queues, the existing backup
+watch loop starts automatically. Confirm new remote backup manifests.
+
+Advance planned storage-node maintenance only after schema and replica
+recovery, not merely `/ping` or Web readiness. The startup gate reduces
+the sequential-reimage failure mode; it is not a zero-RPO guarantee for
+simultaneous host loss. Durable data storage or a fully automated
+recovery design remains a separate performance and reliability choice.
 
 ## SpreadsheetBench evaluation gate
 
