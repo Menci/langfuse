@@ -50,7 +50,9 @@ kubectl apply -f k8s/29-geneva-rbac.yaml
 kubectl apply -f k8s/30-geneva-services.yaml
 ```
 
-Every step is idempotent; re-apply is safe.
+This order bootstraps an environment. For an existing deployment, compare
+the live configuration and update only the intended resources; do not
+replay storage bootstrap or one-shot evaluation Jobs as an upgrade.
 
 ## Runtime-tuned bits pinned in the manifests
 
@@ -84,6 +86,14 @@ identity, same MDM/MDSD auth id
 `MONITORING_ROLE` is set to `SocietasLogNonProd` (same string societas
 uses; ROLE is the Geneva account name, not a per-workload identifier).
 Our data is namespaced by `MONITORING_TENANT: aks-evaluation-wcus`.
+
+Geneva images use versioned tags pinned to the multi-platform digest
+recommended by the Geneva team. For an image update, change only the
+`geneva-services` DaemonSet container images and roll one pod at a time.
+Keep the SecretProviderClass, workload identity, account/tenant mapping,
+certificate configuration, host networking and ClickHouse-node toleration
+unchanged. Retain the previous image references for rollback and confirm
+the running image digests and telemetry before closing the rollout.
 
 Cert distribution:
 
