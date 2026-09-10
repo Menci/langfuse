@@ -161,13 +161,26 @@ node reimage can replace it. Anti-affinity separates the replicas and
 the PDB limits voluntary eviction; neither proves that a replacement
 replica has recovered its schema and parts.
 
-The backup sidecar has a startup-only gate for the deployed schema and
-local replica catch-up. This keeps an empty replacement Pod out of Ready
-and prevents the PDB from treating it as a recovered replica. An
-initialized cluster with no new events passes the gate. The gate is not
-a recurring traffic-freshness check and does not require both peers to
-remain available during later maintenance. Keep its expected table set
-aligned with the deployed Langfuse migrations.
+The backup sidecar distinguishes first installation from recovery using
+the `clickhouse-recovery-state` ConfigMap. Before that marker exists,
+startup checks `/ping`, allowing the operator to finish creating hosts
+and the Web migrations to initialize the schema. Do not enable recovery
+mode before first initialization.
+
+After both hosts have the expected schema and healthy replication,
+apply `recovery/initialized.yaml`. Keep this control-plane marker across
+node reimages; do not store it on the ephemeral data volume or replay it
+as part of an uninitialized `k8s/` bootstrap.
+
+Future containers then require the deployed schema, both configured
+replica memberships, and local replication catch-up before startup
+completes. This keeps an empty or isolated replacement out of Ready
+instead of treating it as a recovered replica. An initialized cluster
+with no new events passes. The check is startup-only: it does not
+continuously test recent traffic or make an already-started container
+unready when its peer later goes down. A container restarted during peer
+maintenance can wait for that peer's recovery. Keep the expected table
+set aligned with the deployed Langfuse migrations.
 
 Per-host ClickHouse Services must publish addresses before Pod readiness
 so migrations and replica recovery can reach a starting host. Confirm

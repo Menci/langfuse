@@ -120,6 +120,12 @@ spec:
                     secretKeyRef:
                       name: langfuse-app-secrets
                       key: CLICKHOUSE_PASSWORD
+                - name: CLICKHOUSE_RECOVERY_GUARD_REQUIRED
+                  valueFrom:
+                    configMapKeyRef:
+                      name: clickhouse-recovery-state
+                      key: initialized
+                      optional: true
                 # Count-based retention, incremental hourly and full daily.
                 - name: BACKUPS_TO_KEEP_LOCAL
                   value: "1"
@@ -144,13 +150,23 @@ spec:
                     - /bin/sh
                     - -ec
                     - |
+                      if [ "${CLICKHOUSE_RECOVERY_GUARD_REQUIRED+x}" != x ]; then
+                        ready=$(curl --silent --show-error --fail --max-time 4 http://127.0.0.1:8123/ping)
+                        [ "$ready" = "Ok." ]
+                        exit
+                      fi
+                      if [ "$CLICKHOUSE_RECOVERY_GUARD_REQUIRED" != true ]; then
+                        echo "Invalid ClickHouse recovery marker; expected true or an absent bootstrap marker" >&2
+                        exit 1
+                      fi
                       auth=$(printf '%s:%s' "$CLICKHOUSE_USERNAME" "$CLICKHOUSE_PASSWORD" | base64 | tr -d '\n')
                       query="SELECT if(
                         (SELECT count() FROM system.tables WHERE database = 'default' AND name IN
                           ('blob_storage_file_log','dataset_run_items','dataset_run_items_rmt','event_log',
                            'observations','project_environments','schema_migrations','scores','traces')) = 9
                         AND (SELECT count() FROM system.replicas WHERE database = 'default') >= 7
-                        AND (SELECT countIf(is_readonly OR is_session_expired OR queue_size > 0 OR future_parts > 0)
+                        AND (SELECT countIf(is_readonly OR is_session_expired OR queue_size > 0 OR future_parts > 0
+                                            OR total_replicas < 2 OR active_replicas < 2)
                              FROM system.replicas WHERE database = 'default') = 0,
                         1, 0) FORMAT TabSeparatedRaw"
                       ready=$(printf 'header = "Authorization: Basic %s"\n' "$auth" |

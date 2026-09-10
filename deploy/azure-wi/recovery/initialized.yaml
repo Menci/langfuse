@@ -1,0 +1,9 @@
+# Apply only after both replicas have the expected schema and healthy
+# replication. This control-plane state must survive storage-node reimages.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-recovery-state
+  namespace: langfuse
+data:
+  initialized: "true"
