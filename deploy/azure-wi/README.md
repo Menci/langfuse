@@ -29,6 +29,13 @@ RBAC to grant the UAI:
 - Storage: `Storage Blob Data Owner` on the storage account
 - Azure OpenAI: `Cognitive Services User`
 
+These are runtime identity grants, not standing human administrator access.
+For operator work, activate the existing temporary Owner eligibility, add
+only the data-plane role and resource scope required by that operation,
+and delete that task-owned assignment immediately afterward. Release the
+Owner activation when finished. Do not remove runtime grants or replace
+them with a human account.
+
 ## Apply order
 
 Manifests are numbered so `kubectl apply -f k8s/` in lexical order works.
