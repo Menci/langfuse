@@ -85,6 +85,32 @@ non-image settings. Rollback must also preserve the effective watch:
 restore the previous image references with the watch overlay rather than
 blindly reverting to an older Helm revision that recorded an empty watch.
 
+## AKS outbound IP classification
+
+The cluster keeps `outboundType: loadBalancer` and uses the user-managed
+Standard IPv4 address `Evaluation/evaluation-aks-egress-pip-wcus`.
+The address is classified with `properties.ipTags`:
+`FirstPartyUsage=/NonProd`. Its allocated address on 2026-09-11 is
+`74.159.24.59`; the former AKS-managed `52.161.33.160` was removed by AKS
+during the supported cutover.
+
+The control-plane identity `evaluation-id-wcus` has Network Contributor
+on this public IP only. This is a runtime grant, not operator access.
+Do not assign the grant to the kubelet or application workload identity.
+Configure the association through AKS, not by editing its managed load balancer:
+
+```powershell
+az aks update --subscription 24c9acbd-c2f5-4ef9-b9a2-486d90208b3e `
+  --resource-group Evaluation --name evaluation-wcus `
+  --load-balancer-outbound-ips /subscriptions/24c9acbd-c2f5-4ef9-b9a2-486d90208b3e/resourceGroups/Evaluation/providers/Microsoft.Network/publicIPAddresses/evaluation-aks-egress-pip-wcus
+```
+
+Egress IP changes can reset connections and require downstream allowlist
+coordination. Returning to `--load-balancer-managed-outbound-ip-count 1`
+can allocate another address; it does not restore the former IP.
+The private ingress load balancer/Private Link Service and the separate
+Eval Web NAT address are not part of this outbound association.
+
 ## Runtime-tuned bits pinned in the manifests
 
 - `CLICKHOUSE_MIGRATION_URL` pins to `chi-langfuse-default-0-0` (not the
