@@ -1,0 +1,64 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: langfuse-worker
+  namespace: langfuse
+spec:
+  selector:
+    app: langfuse-worker
+  ports:
+    - name: metrics
+      port: 3030
+      targetPort: 3030
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langfuse-worker
+  namespace: langfuse
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  selector:
+    matchLabels:
+      app: langfuse-worker
+  template:
+    metadata:
+      labels:
+        app: langfuse-worker
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: langfuse-workload-sa
+      containers:
+        - name: worker
+          image: societasdev.azurecr.io/langfuse/worker:a80eed37e
+          ports:
+            - containerPort: 3030
+              name: metrics
+          envFrom:
+            - configMapRef:
+                name: langfuse-env
+            - secretRef:
+                name: langfuse-app-secrets
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 3Gi
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: metrics
+            initialDelaySeconds: 60
+            periodSeconds: 30

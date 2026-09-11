@@ -1,0 +1,191 @@
+# Geneva monitoring DaemonSet (mdsd + fluentd + mdm) mirroring societas.
+#
+# Sends node + container logs and metrics into the SocietasLogNonProd
+# Geneva account so ops sees this deployment on the same panes societas
+# uses. MONITORING_TENANT=aks-evaluation-wcus namespaces our data.
+#
+# Auth cert (`geneva-cert`, PEM: private key + cert chain) lives in
+# evaluation-langfuse-kv, mounted at container startup via the KV CSI
+# driver using the shared workload identity `langfuse-workload-sa`.
+#
+# hostNetwork=true so mdsd's Geneva egress goes out with the node's own
+# egress IP (some Geneva regions require this for VNet allowlisting) and
+# so fluentd can tail /var/log/containers with real container IDs.
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: geneva-kvcert
+  namespace: langfuse
+spec:
+  provider: azure
+  parameters:
+    # Workload identity — the driver exchanges the SA token for an AAD
+    # token and reads from KV as this identity. `langfuse-workload-sa`
+    # already has Key Vault Secrets User on evaluation-langfuse-kv.
+    clientID: "212f6ee2-d21f-4e9a-87b1-99da9ec13d8b"
+    tenantId: "72f988bf-86f1-41af-91ab-2d7cd011db47"
+    useVMManagedIdentity: "false"
+    useWorkloadIdentity: "true"
+    keyvaultName: "evaluation-langfuse-kv"
+    objects: |
+      array:
+        - |
+          objectName: "geneva-cert"
+          objectType: secret
+          objectFormat: pem
+          objectAlias: geneva_cert.pem
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: geneva-services
+  namespace: langfuse
+  labels:
+    app: geneva-services
+spec:
+  selector:
+    matchLabels:
+      name: geneva-services
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: geneva-services
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: langfuse-workload-sa
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/os: linux
+      # Tolerate the CH-only taint on lpool so Geneva also covers L-series
+      # nodes; societas doesn't have this taint but we do.
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: clickhouse
+          effect: NoSchedule
+      containers:
+        - name: mdsd
+          image: mcr.microsoft.com/geneva/distroless/mdsd:1.43.0-20260728-3@sha256:5c0159feac3312c447b10c840558a5db6591f78c498cf9150e010be9fa860a20
+          command: ["/start_mdsd.sh"]
+          env:
+            - name: MDSD_AKV_CERTIFICATE_STORE_PATH
+              value: /geneva/geneva_auth
+            - name: MONITORING_GCS_AUTH_ID_TYPE
+              value: AuthKeyVault
+            - name: MDSD_DAEMON_TEMPORARY_ELEVATION_DISABLED
+              value: "true"
+            - name: MONITORING_GCS_AUTH_ID
+              value: dev.geneva.keyvault.societas-test.microsoft.com
+            - name: TENANT
+              value: aks-evaluation-wcus
+            - name: ROLE
+              value: SocietasLogNonProd
+            - name: ROLEINSTANCE
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: MONITORING_TENANT
+              value: aks-evaluation-wcus
+            - name: MONITORING_ROLE
+              value: SocietasLogNonProd
+            - name: MONITORING_ROLE_INSTANCE
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: MONITORING_GCS_ENVIRONMENT
+              value: Test
+            - name: MONITORING_GCS_ACCOUNT
+              value: SocietasLogNonProd
+            - name: MONITORING_GCS_REGION
+              value: West Central US
+            - name: MONITORING_GCS_NAMESPACE
+              value: SocietasLogNonProd
+            - name: MONITORING_CONFIG_VERSION
+              value: "1.0"
+            - name: DOCKER_LOGGING
+              value: "true"
+          volumeMounts:
+            - name: keyvault-auth-vol
+              mountPath: /geneva/geneva_auth
+              readOnly: true
+            - name: var-log-geneva-services-vol
+              mountPath: /geneva/geneva_logs
+            - name: mdsd-run-vol
+              mountPath: /var/run/mdsd
+        - name: fluentd
+          image: mcr.microsoft.com/geneva/distroless/fluentd:1.19.3-20260728-3@sha256:99ac79146d330c0ba52956a133e9246a198e62249e7d5ee89a1910cb7b2a8793
+          args:
+            - "-c"
+            - "/etc/fluentd/fluentd.conf"
+            - "--log"
+            - "/dev/stdout"
+          env:
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: fluentd-conf-vol
+              mountPath: /etc/fluentd
+            - name: fluentd-buffer-vol
+              mountPath: /var/log/td-agent
+            - name: mdsd-run-vol
+              mountPath: /var/run/mdsd
+            - name: docker-log-vol
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            - name: var-log-vol
+              mountPath: /var/log
+            - name: run-journal-vol
+              mountPath: /run/log/journal
+              readOnly: true
+        - name: mdm
+          image: mcr.microsoft.com/geneva/distroless/mdm:2.202608241710.0-20260824-1@sha256:861a9145eb6a2d66fbea241df6f3088adf0f313dd8d61090a17a313b6310adef
+          env:
+            - name: MDM_ACCOUNT
+              value: SocietasLogNonProd
+            - name: MDM_INPUT
+              value: statsd_udp
+            - name: MDM_LOG_LEVEL
+              value: Info
+            - name: CERT_FILE
+              value: /tmp/geneva_mdm/geneva_cert.pem
+            - name: KEY_FILE
+              value: /tmp/geneva_mdm/geneva_cert.pem
+          volumeMounts:
+            - name: keyvault-auth-vol
+              mountPath: /tmp/geneva_mdm
+              readOnly: true
+      volumes:
+        - name: keyvault-auth-vol
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: geneva-kvcert
+        - name: mdsd-run-vol
+          hostPath:
+            path: /var/run/mdsd
+            type: DirectoryOrCreate
+        - name: fluentd-conf-vol
+          configMap:
+            name: fluentd-conf
+        - name: fluentd-buffer-vol
+          emptyDir: {}
+        - name: docker-log-vol
+          hostPath:
+            path: /var/lib/docker/containers
+        - name: run-journal-vol
+          hostPath:
+            path: /run/log/journal
+        - name: var-log-vol
+          hostPath:
+            path: /var/log
+        - name: var-log-geneva-services-vol
+          hostPath:
+            path: /var/log/geneva-services
+        - name: etw-vol
+          emptyDir: {}

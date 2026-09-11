@@ -23,6 +23,8 @@ import {
 } from "@langchain/core/output_parsers";
 import { IterableReadableStream } from "@langchain/core/utils/stream";
 import { ChatOpenAI, AzureChatOpenAI } from "@langchain/openai";
+import { getBearerTokenProvider } from "@azure/identity";
+import { getAzureCredential } from "../auth/credentials";
 import { env } from "../../env";
 import GCPServiceAccountKeySchema, {
   BedrockAccessKeysSchema,
@@ -97,6 +99,32 @@ const NON_RETRYABLE_LLM_ERROR_PATTERNS = [
 
 const isLangfuseCloud = Boolean(env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION);
 const AZURE_OPENAI_API_KEY_HEADER = "api-key";
+
+const AZURE_COGNITIVE_SERVICES_SCOPE =
+  "https://cognitiveservices.azure.com/.default";
+
+// getBearerTokenProvider returns a caching, refresh-aware callback per
+// credential. openai-node invokes the provider on every request, so calling
+// getBearerTokenProvider per request would defeat the internal token cache.
+// Cache the provider per client id so the underlying credential — and thus the
+// token cache — is shared across LLM invocations.
+const azureADTokenProviderCache = new Map<
+  string | undefined,
+  () => Promise<string>
+>();
+const getAzureADTokenProviderForOpenAI = (
+  clientId: string | undefined,
+): (() => Promise<string>) => {
+  let provider = azureADTokenProviderCache.get(clientId);
+  if (!provider) {
+    provider = getBearerTokenProvider(
+      getAzureCredential(clientId),
+      AZURE_COGNITIVE_SERVICES_SCOPE,
+    );
+    azureADTokenProviderCache.set(clientId, provider);
+  }
+  return provider;
+};
 const ANTHROPIC_API_KEY_HEADER = "x-api-key";
 const VERTEX_AI_AUTH_HEADER = "authorization";
 const VERTEX_AI_AUTH_SCOPES = [
@@ -518,8 +546,16 @@ export async function fetchLLMCompletion(
       timeout: timeoutMs,
     });
   } else if (modelParams.adapter === LLMAdapter.Azure) {
+    const useAzureManagedIdentity =
+      env.LANGFUSE_AZURE_OPENAI_AUTH_METHOD === "managed-identity";
     chatModel = new AzureChatOpenAI({
-      azureOpenAIApiKey: apiKey,
+      ...(useAzureManagedIdentity
+        ? {
+            azureADTokenProvider: getAzureADTokenProviderForOpenAI(
+              env.LANGFUSE_AZURE_OPENAI_CLIENT_ID,
+            ),
+          }
+        : { azureOpenAIApiKey: apiKey }),
       azureOpenAIBasePath: baseURL ?? undefined,
       azureOpenAIApiDeploymentName: modelParams.model,
       azureOpenAIApiVersion: "2025-02-01-preview",

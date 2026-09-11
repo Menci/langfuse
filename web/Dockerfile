@@ -145,6 +145,11 @@ RUN adduser --system --uid ${UID} nextjs
 
 RUN npm install -g --no-package-lock --no-save prisma@6.19.3
 
+# @azure/identity is used by ./packages/shared/scripts/build-azure-managed-database-url.mjs
+# which the entrypoint runs at migration bootstrap under DATABASE_AUTH_METHOD=azure-managed-identity.
+# It ships outside the Next.js standalone trace so the module has to be present in the runner image.
+RUN npm install --no-package-lock --no-save @azure/identity@^4.13.1
+
 # Install dd-trace only if NEXT_PUBLIC_LANGFUSE_CLOUD_REGION is configured
 ARG NEXT_PUBLIC_LANGFUSE_CLOUD_REGION
 RUN if [ -n "$NEXT_PUBLIC_LANGFUSE_CLOUD_REGION" ]; then \
@@ -171,6 +176,7 @@ COPY --from=builder --chown=nextjs:nodejs /app/packages/shared/clickhouse ./pack
 
 COPY --chown=nextjs:nodejs ./web/entrypoint.sh ./web/entrypoint.sh
 COPY --chown=nextjs:nodejs ./packages/shared/scripts/cleanup.sql ./packages/shared/scripts/cleanup.sql
+COPY --chown=nextjs:nodejs ./packages/shared/scripts/build-azure-managed-database-url.mjs ./packages/shared/scripts/build-azure-managed-database-url.mjs
 RUN chmod +x ./web/entrypoint.sh
 
 USER nextjs

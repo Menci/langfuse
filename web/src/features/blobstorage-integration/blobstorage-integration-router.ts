@@ -398,6 +398,10 @@ export const blobStorageIntegrationRouter = createTRPCRouter({
           region: region || undefined,
           forcePathStyle: forcePathStyle || false,
           useAzureBlob: type === BlobStorageIntegrationType.AZURE_BLOB_STORAGE,
+          // Per-project blob storage integrations use user-entered credentials
+          // for a foreign storage account; the pod-level managed identity has
+          // no access to it.
+          useAzureManagedIdentity: false,
           useGoogleCloudStorage: false, // Not supported in blob storage integration
           useOCIObjectStorage: false, // Not supported in blob storage integration
           googleCloudCredentials: undefined,

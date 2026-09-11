@@ -1,0 +1,54 @@
+# 3-node ClickHouse Keeper quorum (majority is 2, so any one node can be
+# reimaged without losing quorum). Keeper coordinates ReplicatedMergeTree
+# writes across CH replicas — losing quorum stalls writes but doesn't lose
+# committed data.
+#
+# Runs on the general E32as_v5 nodepool (azlpool1). Keeper's per-node
+# footprint is tiny (10-50 MB RAM, a few MB/s of log I/O), so managed disk
+# is fine.
+apiVersion: "clickhouse-keeper.altinity.com/v1"
+kind: "ClickHouseKeeperInstallation"
+metadata:
+  name: langfuse-keeper
+  namespace: langfuse
+spec:
+  defaults:
+    templates:
+      podTemplate: default
+      dataVolumeClaimTemplate: default
+  configuration:
+    clusters:
+      - name: keeper
+        layout:
+          replicasCount: 3
+    settings:
+      logger/level: "warning"
+      logger/console: "true"
+      # 4kw commands used by the operator for health checks
+      keeper_server/four_letter_word_white_list: "*"
+      keeper_server/coordination_settings/raft_logs_level: "warning"
+  templates:
+    podTemplates:
+      - name: default
+        spec:
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      clickhouse-keeper.altinity.com/app: chop
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: clickhouse-keeper
+              image: societasdev.azurecr.io/evaluation/third-party/clickhouse/clickhouse-keeper:24.12@sha256:6330e7f43f55c81f227f3a8d54843ab4aaa3078407928c64ad3833a108df7e68
+              resources:
+                requests: {cpu: 100m, memory: 256Mi}
+                limits:   {memory: 1Gi}
+    volumeClaimTemplates:
+      - name: default
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: managed-csi-premium
+          resources:
+            requests:
+              storage: 10Gi

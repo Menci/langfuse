@@ -39,6 +39,18 @@ const EnvSchema = z.object({
     .nullable(),
   REDIS_AUTH: z.string().nullish(),
   REDIS_USERNAME: z.string().nullish(),
+  REDIS_AUTH_METHOD: z
+    .enum(["password", "azure-managed-identity"])
+    .default("password"),
+  REDIS_AZURE_CLIENT_ID: z.string().optional(),
+  DATABASE_AUTH_METHOD: z
+    .enum(["password", "azure-managed-identity"])
+    .default("password"),
+  DATABASE_AZURE_CLIENT_ID: z.string().optional(),
+  LANGFUSE_AZURE_OPENAI_AUTH_METHOD: z
+    .enum(["api-key", "managed-identity"])
+    .default("api-key"),
+  LANGFUSE_AZURE_OPENAI_CLIENT_ID: z.string().optional(),
   REDIS_CONNECTION_STRING: z.string().nullish(),
   // Optional prefix for Redis keys. Used by BullMQ queues via their native prefix option
   // and by the singleton cache instance via ioredis keyPrefix. Useful for multi-tenant Redis.
@@ -255,6 +267,10 @@ const EnvSchema = z.object({
   LANGFUSE_S3_MEDIA_UPLOAD_SSE: z.enum(["AES256", "aws:kms"]).optional(),
   LANGFUSE_S3_MEDIA_UPLOAD_SSE_KMS_KEY_ID: z.string().optional(),
   LANGFUSE_USE_AZURE_BLOB: z.enum(["true", "false"]).default("false"),
+  LANGFUSE_AZURE_BLOB_AUTH_METHOD: z
+    .enum(["shared-key", "managed-identity"])
+    .default("shared-key"),
+  LANGFUSE_AZURE_BLOB_CLIENT_ID: z.string().optional(),
   LANGFUSE_AZURE_SKIP_CONTAINER_CHECK: z
     .enum(["true", "false"])
     .default("true"),

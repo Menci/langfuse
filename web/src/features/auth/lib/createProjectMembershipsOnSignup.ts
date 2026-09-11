@@ -178,7 +178,7 @@ export async function createProjectMembershipsOnSignup(
     if (
       isCloudDeployment &&
       !joinedRealOrganizationViaInvitation &&
-      canCreateOrganizations(user.email) &&
+      canCreateOrganizations({ email: user.email, admin: false }) &&
       (options?.userWasJustCreated || isNewUser)
     ) {
       const starterOrg = await provisionStarterOrganizationForNewUser({

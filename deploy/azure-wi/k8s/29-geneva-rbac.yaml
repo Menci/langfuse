@@ -1,0 +1,24 @@
+# Fluentd (inside the Geneva DaemonSet) uses fluent-plugin-kubernetes_metadata_filter
+# to enrich log records with pod/namespace metadata, which requires cluster-wide
+# get/watch/list on pods+namespaces. Mirrors societas' `geneva-reader` role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: geneva-reader
+rules:
+  - apiGroups: [""]
+    resources: [pods, namespaces]
+    verbs: [get, watch, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: geneva-read-global
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: geneva-reader
+subjects:
+  - kind: ServiceAccount
+    name: langfuse-workload-sa
+    namespace: langfuse

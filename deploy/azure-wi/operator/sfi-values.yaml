@@ -1,0 +1,19 @@
+# Image-only overlay for the existing 0.27.1 chart and cluster-wide watch.
+operator:
+  image:
+    registry: societasdev.azurecr.io
+    repository: evaluation/third-party/altinity/clickhouse-operator
+    tag: 0.27.1@sha256:a802b3a19d2011f672c32cea6733e573e004938ff463d1c3ab4ac0b16b9877dd
+metrics:
+  image:
+    registry: societasdev.azurecr.io
+    repository: evaluation/third-party/altinity/metrics-exporter
+    tag: 0.27.1@sha256:5523d83190ad1560051f19fe6daa00876436f12cf833a506731ed6226192193f
+configs:
+  files:
+    config.yaml:
+      watch:
+        namespaces:
+          include:
+            - ".*"
+          exclude: []

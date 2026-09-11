@@ -130,7 +130,10 @@ const staticProviders: Provider[] = [
         image: dbUser.image,
         emailVerified: dbUser.emailVerified?.toISOString(),
         featureFlags: parseFlags(dbUser.featureFlags),
-        canCreateOrganizations: canCreateOrganizations(dbUser.email),
+        canCreateOrganizations: canCreateOrganizations({
+          email: dbUser.email,
+          admin: dbUser.admin,
+        }),
         organizations: [],
       };
 
@@ -596,17 +599,31 @@ const extendedPrismaAdapter: Adapter = {
   async createUser(profile: Omit<AdapterUser, "id">) {
     if (!prismaAdapter.createUser)
       throw new Error("createUser not implemented");
-    if (
-      env.NEXT_PUBLIC_SIGN_UP_DISABLED === "true" ||
-      env.AUTH_DISABLE_SIGNUP === "true"
-    ) {
-      throw new Error("Sign up is disabled.");
-    }
     if (!profile.email) {
       throw new Error(
         "Cannot create db user as login profile does not contain an email: " +
           JSON.stringify(profile),
       );
+    }
+    const signupDisabled =
+      env.NEXT_PUBLIC_SIGN_UP_DISABLED === "true" ||
+      env.AUTH_DISABLE_SIGNUP === "true";
+    if (signupDisabled) {
+      // Allow the SIGNUP block to be bypassed when the incoming user already
+      // has a pending organization/project invitation. This is what turns the
+      // upstream "disabled means nobody new can sign up" gate into an
+      // invitation-only allowlist: an admin invites an email, that email
+      // logs in via SSO, the invitation is consumed by
+      // processMembershipInvitations() (called from createProjectMembershipsOnSignup)
+      // and the user is dropped into the invited org(s). Uninvited users still
+      // hit "Sign up is disabled."
+      const pendingInvitation = await prisma.membershipInvitation.findFirst({
+        where: { email: profile.email.toLowerCase() },
+        select: { id: true },
+      });
+      if (!pendingInvitation) {
+        throw new Error("Sign up is disabled.");
+      }
     }
 
     const user = await prismaAdapter.createUser(profile);
@@ -868,9 +885,10 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
                             )
                           : true
                         : false,
-                    canCreateOrganizations: canCreateOrganizations(
-                      dbUser.email,
-                    ),
+                    canCreateOrganizations: canCreateOrganizations({
+                      email: dbUser.email,
+                      admin: dbUser.admin,
+                    }),
                     organizations: dbUser.organizationMemberships.map(
                       (orgMembership) => {
                         const parsedCloudConfig = CloudConfigSchema.safeParse(

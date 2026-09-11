@@ -1,0 +1,197 @@
+# 2-replica ReplicatedReplacingMergeTree cluster on L8s_v4 local NVMe.
+# Both replicas pinned to the lpool nodepool via nodeSelector + toleration.
+# podAntiAffinity places replicas on different nodes. It does not make
+# ephemeral OS storage durable or wait for schema/data recovery.
+#
+# Sidecar `clickhouse-backup` in each replica runs its own watch loop,
+# hard-linking freshly-frozen CH parts and uploading them to
+# `evaluationwcus/langfuse-clickhouse-backup` via workload-identity
+# (langfuse-workload-sa is already annotated with the AAD client id and
+# has Storage Blob Data Owner on the account). Full snapshot daily,
+# incremental every hour, with count-based remote retention of 168 backups.
+#
+# Both replicas back up independently under distinct prefixes so a single
+# replica loss can be restored from the other; the daily storage overhead
+# is negligible against the 100 TB blob-account quota.
+apiVersion: "clickhouse.altinity.com/v1"
+kind: "ClickHouseInstallation"
+metadata:
+  name: langfuse
+  namespace: langfuse
+spec:
+  defaults:
+    templates:
+      podTemplate: clickhouse-l8sv4
+      dataVolumeClaimTemplate: local-nvme
+  configuration:
+    users:
+      default/password:
+        valueFrom:
+          secretKeyRef:
+            name: langfuse-app-secrets
+            key: CLICKHOUSE_PASSWORD
+      default/networks/ip:
+        - "0.0.0.0/0"
+        - "::/0"
+      default/profile: default
+      default/quota: default
+      default/access_management: 1
+    zookeeper:
+      nodes:
+        - host: keeper-langfuse-keeper.langfuse.svc.cluster.local
+          port: 2181
+    # The Langfuse "clustered" migration set (packages/shared/clickhouse/
+    # migrations/clustered/) issues `ON CLUSTER default`, so the cluster
+    # name MUST be `default`.
+    clusters:
+      - name: default
+        layout:
+          shardsCount: 1
+          replicasCount: 2
+  templates:
+    podTemplates:
+      - name: clickhouse-l8sv4
+        metadata:
+          labels:
+            # Enables the azure-workload-identity mutating webhook to
+            # inject the AAD token file + env vars into every container in
+            # the pod (main + sidecar).
+            azure.workload.identity/use: "true"
+        spec:
+          serviceAccountName: langfuse-workload-sa
+          nodeSelector:
+            workload: clickhouse
+          tolerations:
+            - key: workload
+              operator: Equal
+              value: clickhouse
+              effect: NoSchedule
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      clickhouse.altinity.com/chi: langfuse
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: clickhouse
+              image: societasdev.azurecr.io/evaluation/third-party/clickhouse/clickhouse-server:24.12@sha256:a65ca89ddbe8e04a05036dd7d7110a203256293b407b9359130ed5e4333f45ff
+              volumeMounts:
+                - name: local-nvme
+                  mountPath: /var/lib/clickhouse
+              resources:
+                requests: {cpu: "4", memory: 32Gi}
+                limits:   {memory: 56Gi}
+            - name: clickhouse-backup
+              image: societasdev.azurecr.io/evaluation/third-party/altinity/clickhouse-backup:2.6.20@sha256:bd642ce6238f8aa5aa5f01d166767a02edb0b52c51c9bf317ce13f66029620e5
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: LOG_LEVEL
+                  value: "info"
+                # Defined first so subsequent AZBLOB_PATH can reference it
+                # (Kubernetes only resolves $(VAR) against env vars that
+                # appear earlier in the list).
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: REMOTE_STORAGE
+                  value: "azblob"
+                - name: AZBLOB_ACCOUNT_NAME
+                  value: "evaluationwcus"
+                - name: AZBLOB_ENDPOINT_SUFFIX
+                  value: "core.windows.net"
+                - name: AZBLOB_CONTAINER
+                  value: "langfuse-clickhouse-backup"
+                - name: AZBLOB_PATH
+                  # Different prefix per replica so both can back up
+                  # independently without stepping on each other.
+                  value: "$(POD_NAME)"
+                - name: AZBLOB_USE_MANAGED_IDENTITY
+                  value: "true"
+                - name: CLICKHOUSE_HOST
+                  value: "127.0.0.1"
+                - name: CLICKHOUSE_PORT
+                  value: "9000"
+                - name: CLICKHOUSE_USERNAME
+                  value: "default"
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: langfuse-app-secrets
+                      key: CLICKHOUSE_PASSWORD
+                - name: CLICKHOUSE_RECOVERY_GUARD_REQUIRED
+                  valueFrom:
+                    configMapKeyRef:
+                      name: clickhouse-recovery-state
+                      key: initialized
+                      optional: true
+                # Count-based retention, incremental hourly and full daily.
+                - name: BACKUPS_TO_KEEP_LOCAL
+                  value: "1"
+                - name: BACKUPS_TO_KEEP_REMOTE
+                  value: "168"
+              # Keep the sidecar alive before the first Langfuse migration.
+              # A bare `watch` exits after repeated "no tables" errors, which
+              # makes the whole Pod NotReady and suppresses the headless
+              # ClickHouse DNS record that migrations need.
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  until clickhouse-backup tables 2>/dev/null | grep -q .; do
+                    sleep 30
+                  done
+                  exec clickhouse-backup watch --watch-interval=1h --full-interval=24h
+              # Keep a newly started replica out of Ready until its schema
+              # and replication queue recover. No recent writes are required.
+              startupProbe:
+                exec:
+                  command:
+                    - /bin/sh
+                    - -ec
+                    - |
+                      if [ "${CLICKHOUSE_RECOVERY_GUARD_REQUIRED+x}" != x ]; then
+                        ready=$(curl --silent --show-error --fail --max-time 4 http://127.0.0.1:8123/ping)
+                        [ "$ready" = "Ok." ]
+                        exit
+                      fi
+                      if [ "$CLICKHOUSE_RECOVERY_GUARD_REQUIRED" != true ]; then
+                        echo "Invalid ClickHouse recovery marker; expected true or an absent bootstrap marker" >&2
+                        exit 1
+                      fi
+                      auth=$(printf '%s:%s' "$CLICKHOUSE_USERNAME" "$CLICKHOUSE_PASSWORD" | base64 | tr -d '\n')
+                      query="SELECT if(
+                        (SELECT count() FROM system.tables WHERE database = 'default' AND name IN
+                          ('blob_storage_file_log','dataset_run_items','dataset_run_items_rmt','event_log',
+                           'observations','project_environments','schema_migrations','scores','traces')) = 9
+                        AND (SELECT count() FROM system.replicas WHERE database = 'default') >= 7
+                        AND (SELECT countIf(is_readonly OR is_session_expired OR queue_size > 0 OR future_parts > 0
+                                            OR total_replicas < 2 OR active_replicas < 2)
+                             FROM system.replicas WHERE database = 'default') = 0,
+                        1, 0) FORMAT TabSeparatedRaw"
+                      ready=$(printf 'header = "Authorization: Basic %s"\n' "$auth" |
+                        curl --config - --silent --show-error --fail --max-time 4 \
+                          --url http://127.0.0.1:8123/ --data-binary "$query")
+                      [ "$ready" = "1" ]
+                periodSeconds: 10
+                timeoutSeconds: 5
+                failureThreshold: 180
+                successThreshold: 1
+              volumeMounts:
+                - name: local-nvme
+                  mountPath: /var/lib/clickhouse
+              resources:
+                requests: {cpu: 100m, memory: 128Mi}
+                limits:   {memory: 1Gi}
+    volumeClaimTemplates:
+      - name: local-nvme
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: local-nvme
+          resources:
+            requests:
+              storage: 1500Gi
+# The operator creates a PodDisruptionBudget with maxUnavailable=1.
+# PDBs constrain voluntary eviction based on Ready, not disk durability.
+# The startup gate prevents an empty replacement from counting as recovered;
+# never force-drain another replica to bypass a failed recovery gate.

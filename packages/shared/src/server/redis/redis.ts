@@ -3,6 +3,13 @@ import type { QueueBaseOptions } from "bullmq";
 import fs from "fs";
 import { env } from "../../env";
 import { logger } from "../logger";
+import {
+  RefreshingTokenManager,
+  createAzureManagedCredentialProvider,
+  type ManagedAccessToken,
+} from "../auth/credentials";
+
+const AZURE_REDIS_SCOPE = "https://redis.azure.com/.default";
 
 const defaultRedisOptions: Partial<RedisOptions> = {
   enableReadyCheck: true,
@@ -200,6 +207,164 @@ const createRedisSentinelInstance = (
   return instance;
 };
 
+// ioredis has no async credential hook. To pipe a rotating AAD token to the
+// live TCP session we (a) start lazyConnect, (b) fetch the initial token when
+// connect() is invoked, (c) subscribe to RefreshingTokenManager and issue AUTH
+// on the open connection whenever a refresh lands. If AUTH fails mid-session
+// we drop the connection so ioredis's retryStrategy reconnects and the wrapper
+// re-fetches a fresh token on the way in.
+type IoredisCondition = {
+  auth: string | [string, string] | null;
+  select: number | undefined;
+  subscriber: boolean;
+};
+
+const applyAzureManagedIdentityAuth = (
+  instance: Redis,
+  options: RedisOptions,
+  username: string,
+): void => {
+  const provider = createAzureManagedCredentialProvider({
+    name: "redis",
+    scope: AZURE_REDIS_SCOPE,
+    clientId: env.REDIS_AZURE_CLIENT_ID,
+    username,
+  });
+  const manager = new RefreshingTokenManager(provider);
+  const conditioned = instance as unknown as {
+    condition: IoredisCondition | null;
+  };
+
+  const applyToken = (token: ManagedAccessToken): void => {
+    options.password = token.token;
+    (instance.options as RedisOptions).password = token.token;
+    // ioredis snapshots password into `condition.auth` at construction time
+    // and consults that snapshot for every AUTH — mutating options.password
+    // alone is not enough. Rewrite the snapshot so the next connect (both the
+    // wrapped initial one and any ioredis auto-reconnect) sends the fresh
+    // token.
+    if (conditioned.condition) {
+      conditioned.condition.auth = [username, token.token];
+    }
+  };
+
+  const originalConnect = instance.connect.bind(instance);
+  (instance as unknown as { connect: typeof instance.connect }).connect = ((
+    ...args: Parameters<typeof originalConnect>
+  ) => {
+    // ioredis's Redis.prototype.connect initializes `this.condition` inside
+    // its Promise executor, synchronously. Our wrapper defers originalConnect
+    // behind an async token fetch, so between wrapper invocation and the
+    // token promise resolving `this.condition` stays null. If a caller (or
+    // ioredis itself, via sendCommand's auto-connect-on-wait path) queues a
+    // command during that window, the offlineQueue push reads
+    // `this.condition.select` and throws
+    // `Cannot read properties of undefined (reading 'select')`. Pre-seed
+    // condition synchronously with the same shape ioredis would install;
+    // originalConnect and applyToken will overwrite `auth` with the real
+    // token before the socket sends its first AUTH.
+    if (!conditioned.condition) {
+      conditioned.condition = {
+        auth: null,
+        select: instance.options.db,
+        subscriber: false,
+      };
+    }
+    return manager.start().then((token) => {
+      applyToken(token);
+      return originalConnect(...args);
+    });
+  }) as typeof instance.connect;
+
+  manager.onRefresh((token) => {
+    applyToken(token);
+    if (instance.status !== "ready") return;
+    // Fire the AUTH command on the live socket. If it fails (network blip,
+    // NOAUTH race), disconnect and let ioredis reconnect with the fresh token
+    // via the wrapped connect() path.
+    instance.call("AUTH", username, token.token).catch((error) => {
+      logger.error(
+        "Failed to send AUTH with refreshed Azure Managed Redis token; forcing reconnect",
+        error,
+      );
+      instance.disconnect(true); // reconnect
+    });
+  });
+
+  instance.on("end", () => {
+    manager.stop();
+  });
+
+  // BullMQ's Worker constructor duplicates the passed connection to get a
+  // separate blocking-command channel (redis.duplicate()). Duplicated ioredis
+  // instances inherit `options` by structural clone but NOT the connect
+  // wrapper we installed, so they'd send AUTH with whatever `options.password`
+  // happened to be at duplication time — undefined at cold start, then a
+  // fixed token that never rotates. Rewrap duplicates the same way so every
+  // downstream instance has its own token manager.
+  const originalDuplicate = instance.duplicate.bind(instance);
+  (instance as unknown as { duplicate: typeof instance.duplicate }).duplicate =
+    ((...args: Parameters<typeof originalDuplicate>) => {
+      const duplicated = originalDuplicate(...args);
+      applyAzureManagedIdentityAuth(
+        duplicated,
+        duplicated.options as RedisOptions,
+        username,
+      );
+      return duplicated;
+    }) as typeof instance.duplicate;
+};
+
+const createAzureManagedRedisInstance = (
+  additionalOptions: Partial<RedisOptions>,
+): Redis | null => {
+  if (env.REDIS_CLUSTER_ENABLED === "true") {
+    logger.error(
+      "REDIS_AUTH_METHOD=azure-managed-identity is not supported with REDIS_CLUSTER_ENABLED=true. Strict compliance requires per-connection AUTH rotation, which ioredis Cluster mode does not surface reliably.",
+    );
+    return null;
+  }
+  if (env.REDIS_SENTINEL_ENABLED === "true") {
+    logger.error(
+      "REDIS_AUTH_METHOD=azure-managed-identity is not supported with REDIS_SENTINEL_ENABLED=true. Strict compliance requires per-connection AUTH rotation, which ioredis Sentinel mode does not surface reliably.",
+    );
+    return null;
+  }
+  if (!env.REDIS_USERNAME) {
+    logger.error(
+      "REDIS_USERNAME (the principal name used for AAD AUTH) is required when REDIS_AUTH_METHOD=azure-managed-identity",
+    );
+    return null;
+  }
+  if (!env.REDIS_HOST) {
+    logger.error(
+      "REDIS_HOST is required when REDIS_AUTH_METHOD=azure-managed-identity",
+    );
+    return null;
+  }
+
+  const tlsOptions = buildTlsOptions();
+  const options: RedisOptions = {
+    host: String(env.REDIS_HOST),
+    port: Number(env.REDIS_PORT),
+    username: env.REDIS_USERNAME,
+    // Defer connect so applyAzureManagedIdentityAuth can inject the initial
+    // AAD token before ioredis sends AUTH.
+    lazyConnect: true,
+    ...defaultRedisOptions,
+    ...additionalOptions,
+    ...tlsOptions,
+  };
+  const instance = new Redis(options);
+  applyAzureManagedIdentityAuth(instance, options, env.REDIS_USERNAME);
+
+  instance.on("error", (error) => {
+    logger.error("Redis error", error);
+  });
+
+  return instance;
+};
+
 export const createNewRedisInstance = (
   additionalOptions: Partial<RedisOptions> = {},
 ): Redis | Cluster | null => {
@@ -211,6 +376,10 @@ export const createNewRedisInstance = (
       "Invalid Redis configuration: REDIS_CLUSTER_ENABLED and REDIS_SENTINEL_ENABLED cannot both be true",
     );
     return null;
+  }
+
+  if (env.REDIS_AUTH_METHOD === "azure-managed-identity") {
+    return createAzureManagedRedisInstance(additionalOptions);
   }
 
   if (env.REDIS_CLUSTER_ENABLED === "true") {
@@ -252,14 +421,22 @@ export const createNewRedisInstance = (
  * Get the queue prefix for BullMQ cluster compatibility
  * In cluster mode, uses hash tags to ensure queue keys are on the same node
  * In single-node mode, returns the configured prefix or undefined
+ *
+ * Azure Managed Redis (Enterprise SKU) is sharded server-side even in
+ * `EnterpriseCluster` policy — the single endpoint transparently routes
+ * commands, but multi-key Lua scripts still fail with CROSSSLOT unless the
+ * keys hash to the same slot. Treat MI mode the same as cluster mode so
+ * BullMQ's queue-key family stays colocated.
  */
 export const getQueuePrefix = (queueName: string): string | undefined => {
   const redisKeyPrefix = env.REDIS_KEY_PREFIX;
+  const needsHashTag =
+    env.REDIS_CLUSTER_ENABLED === "true" ||
+    env.REDIS_AUTH_METHOD === "azure-managed-identity";
 
-  if (env.REDIS_CLUSTER_ENABLED === "true") {
-    // Use hash tags for Redis cluster compatibility
-    // This ensures all keys for a queue are placed on the same hash slot
-    // Format: {prefix:queueName} ensures all keys land on same slot
+  if (needsHashTag) {
+    // Hash tags ensure all keys for a queue land on the same slot.
+    // Format: {prefix:queueName} — Redis hashes only the substring inside {}.
     return redisKeyPrefix
       ? `{${redisKeyPrefix}:${queueName}}`
       : `{${queueName}}`;
@@ -320,8 +497,13 @@ export const safeMultiDel = async (
 ): Promise<void> => {
   if (!redis || keys.length === 0) return;
 
-  if (env.REDIS_CLUSTER_ENABLED === "true") {
-    // In cluster mode, delete keys in separate commands to avoid CROSSSLOT errors
+  const isSharded =
+    env.REDIS_CLUSTER_ENABLED === "true" ||
+    env.REDIS_AUTH_METHOD === "azure-managed-identity";
+
+  if (isSharded) {
+    // Sharded backends reject multi-key DEL when keys land on different slots.
+    // Issue each DEL as its own command so ioredis's slot check passes.
     await Promise.all(keys.map(async (key: string) => redis.del(key)));
   } else {
     // In single-node mode, can delete all keys at once

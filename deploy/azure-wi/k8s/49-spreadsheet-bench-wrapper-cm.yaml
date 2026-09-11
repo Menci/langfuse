@@ -1,0 +1,255 @@
+apiVersion: v1
+data:
+  evaluate_spreadsheet_bench.py: |
+    """Run the SpreadsheetBench golden-answer evaluator against a set of
+    predicted xlsx files and log every case to Langfuse.
+
+    Uses `DatasetClient.run_experiment()` (Langfuse SDK v4) so the SDK owns
+    per-item trace + DatasetRunItem + score wiring; we only supply a `task`
+    that locates the predicted xlsx and an `evaluator` that wraps
+    compare_workbooks().
+
+    Predicted xlsx location is a template so the same job can score both:
+
+      # A real agent's flat outputs directory:
+      --predicted-dir /predicted --predicted-template "{task_id}.xlsx"
+
+      # The no-op `init` baseline sitting inside the vendored dataset tree:
+      --predicted-dir /app/spreadsheet-bench/data/verified-400/spreadsheet \
+      --predicted-template "{task_id}/1_{task_id}_init.xlsx"
+    """
+
+    from __future__ import annotations
+
+    import argparse
+    import os
+    import sys
+    from pathlib import Path
+
+    from langfuse import Langfuse
+    from langfuse.experiment import Evaluation
+
+
+    def _make_task(predicted_root: Path, template: str):
+        def task(*, item, **_kwargs):
+            task_id = item.input["task_id"]
+            relative = template.format(task_id=task_id)
+            candidate = predicted_root / relative
+            exists = candidate.is_file()
+            return {
+                "task_id": task_id,
+                "predicted_exists": exists,
+                "predicted_path": str(candidate) if exists else None,
+                "predicted_template": template,
+            }
+
+        return task
+
+
+    def _make_evaluator(data_root: Path, compare_workbooks):
+        def evaluator(*, input, output, expected_output, **_kwargs):
+            itype = (expected_output or {}).get("instruction_type") or "unknown"
+            # Always emit the categorical dim so we can filter pass rate by
+            # Cell-Level vs Sheet-Level in the Langfuse UI, even for skipped items.
+            type_score = Evaluation(
+                name="instruction_type",
+                value=itype,
+                data_type="CATEGORICAL",
+            )
+            if not output.get("predicted_exists"):
+                return [
+                    Evaluation(
+                        name="pass",
+                        value=0,
+                        data_type="BOOLEAN",
+                        comment="no predicted xlsx at expected path",
+                    ),
+                    type_score,
+                ]
+            golden = data_root / expected_output["golden_xlsx_pvc_path"]
+            try:
+                ok, detail = compare_workbooks(
+                    str(golden),
+                    output["predicted_path"],
+                    expected_output["instruction_type"],
+                    expected_output["answer_position"],
+                )
+            except Exception as exc:
+                return [
+                    Evaluation(
+                        name="pass",
+                        value=0,
+                        data_type="BOOLEAN",
+                        comment=f"compare_workbooks raised: {exc}"[:500],
+                    ),
+                    type_score,
+                ]
+            return [
+                Evaluation(
+                    name="pass",
+                    value=1 if ok else 0,
+                    data_type="BOOLEAN",
+                    comment=(detail or ("match" if ok else ""))[:500],
+                ),
+                type_score,
+            ]
+
+        return evaluator
+
+
+    def main() -> int:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--dataset", default="spreadsheet-bench-v400")
+        parser.add_argument("--run-name", required=True)
+        parser.add_argument("--predicted-dir", required=True)
+        parser.add_argument(
+            "--predicted-template",
+            default="{task_id}.xlsx",
+            help="Path relative to --predicted-dir, with {task_id} placeholder",
+        )
+        parser.add_argument("--description", default=None)
+        parser.add_argument("--max-concurrency", type=int, default=8)
+        args = parser.parse_args()
+
+        code_root = Path(os.environ.get("SB_CODE_ROOT", "/app/spreadsheet-bench"))
+        data_root = code_root / "data" / "verified-400"
+
+        sys.path.insert(0, str(code_root))
+        from evaluation.evaluation import compare_workbooks  # type: ignore
+
+        predicted_root = Path(args.predicted_dir)
+        lf = Langfuse()
+        ds = lf.get_dataset(args.dataset)
+
+        result = ds.run_experiment(
+            name=args.run_name,
+            description=args.description,
+            task=_make_task(predicted_root, args.predicted_template),
+            evaluators=[_make_evaluator(data_root, compare_workbooks)],
+            max_concurrency=args.max_concurrency,
+        )
+
+        total = len(result.item_results)
+        passes = sum(
+            1
+            for r in result.item_results
+            for e in (r.evaluations or [])
+            if e.name == "pass" and float(e.value or 0) >= 0.5
+        )
+        print(
+            f"dataset={args.dataset} run={args.run_name} "
+            f"predicted_root={predicted_root} template={args.predicted_template}"
+        )
+        print(f"total={total} pass={passes} pass_rate={passes / total:.3f}" if total else "no items")
+        return 0
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())
+  import_dataset_spreadsheet_bench.py: |
+    """Import SpreadsheetBench Verified-400 into a Langfuse Dataset.
+
+    Idempotent: create_dataset upserts by name, create_dataset_item upserts by id.
+    Re-running this after the dataset already exists silently reconciles any
+    changed field on each item without duplicating rows.
+
+    The xlsx files themselves stay on the PVC (`spreadsheet-bench-data`). Only
+    their PVC-relative paths land in each DatasetItem, so evaluate jobs open
+    them from the filesystem instead of pulling MB-sized blobs through the
+    Langfuse API on every run.
+    """
+
+    from __future__ import annotations
+
+    import json
+    import os
+    import sys
+    from pathlib import Path
+
+    from langfuse import Langfuse
+
+
+    DATASET_NAME = "spreadsheet-bench-v400"
+    DATASET_DESCRIPTION = (
+        "SpreadsheetBench Verified-400 golden-answer benchmark: 400 spreadsheet "
+        "manipulation tasks. Each item pairs an initial xlsx + prompt with a "
+        "golden xlsx and an `answer_position` cell range for exact-value "
+        "comparison.\n\n"
+        "Dataset: SpreadsheetBench (Ma et al., NeurIPS 2024). "
+        "License: CC BY-SA 4.0. "
+        "Source: https://github.com/RUCKBReasoning/SpreadsheetBench."
+    )
+
+
+    def main() -> int:
+        code_root = Path(os.environ.get("SB_CODE_ROOT", "/app/spreadsheet-bench"))
+        data_root = code_root / "data" / "verified-400"
+        if not (data_root / "dataset.json").exists():
+            print(
+                f"error: dataset.json not found at {data_root}/dataset.json — "
+                "run download_data.py to populate the PVC first",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Reuse the vendored helper so the normalized answer_position we store
+        # matches exactly what compare_workbooks parses in the evaluator.
+        sys.path.insert(0, str(code_root))
+        from download_data import answer_ranges  # type: ignore
+
+        tasks = json.loads((data_root / "dataset.json").read_text())
+        lf = Langfuse()
+
+        lf.create_dataset(
+            name=DATASET_NAME,
+            description=DATASET_DESCRIPTION,
+            metadata={
+                "license": "CC BY-SA 4.0",
+                "source": "https://github.com/RUCKBReasoning/SpreadsheetBench",
+                "vendor_commit": "49b73a94775fb489063f60ca1865e3a650079a79",
+                "task_count": len(tasks),
+            },
+        )
+
+        for task in tasks:
+            task_id = str(task["id"])
+            prompt_file = data_root / "spreadsheet" / task_id / "prompt.txt"
+            prompt = (
+                prompt_file.read_text(encoding="utf-8").strip()
+                if prompt_file.exists()
+                else str(task.get("instruction", ""))
+            )
+            rel_init = f"spreadsheet/{task_id}/1_{task_id}_init.xlsx"
+            rel_golden = f"spreadsheet/{task_id}/1_{task_id}_golden.xlsx"
+
+            lf.create_dataset_item(
+                dataset_name=DATASET_NAME,
+                id=f"sb-v400-{task_id}",
+                input={
+                    "task_id": task_id,
+                    "prompt": prompt,
+                    "init_xlsx_pvc_path": rel_init,
+                },
+                expected_output={
+                    "answer_position": answer_ranges(task),
+                    "instruction_type": task["instruction_type"],
+                    "answer_sheet": task.get("answer_sheet"),
+                    "golden_xlsx_pvc_path": rel_golden,
+                },
+                metadata={
+                    "task_id": task_id,
+                    "license": "CC BY-SA 4.0",
+                },
+            )
+
+        lf.flush()
+        print(f"imported {len(tasks)} items into dataset '{DATASET_NAME}'")
+        return 0
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())
+kind: ConfigMap
+metadata:
+  name: spreadsheet-bench-wrapper
+  namespace: langfuse
